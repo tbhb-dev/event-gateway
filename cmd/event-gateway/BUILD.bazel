@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright Tony Burns
+
+load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
+load("@tbhb_rules//repo:defs.bzl", "repo_files")
+
+repo_files()
+
+go_library(
+    name = "event-gateway_lib",
+    srcs = ["main.go"],
+    importpath = "go.tbhb.dev/event-gateway/cmd/event-gateway",
+    visibility = ["//visibility:private"],
+)
+
+go_binary(
+    name = "event-gateway",
+    embed = [":event-gateway_lib"],
+    visibility = ["//visibility:public"],
+)
+
+go_test(
+    name = "event-gateway_test",
+    srcs = ["main_internal_test.go"],
+    embed = [":event-gateway_lib"],
+    # The whole-module Go checks in the root package take the tests too.
+    visibility = ["//:__pkg__"],
+)

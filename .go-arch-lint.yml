@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright Tony Burns
+
+---
+# Import contracts. The command is the only package so far, and it imports
+# nothing of the module. Every package must belong to a component.
+version: 3
+
+allow:
+  depOnAnyVendor: false
+  deepScan: false  # deep scanning runs the go command; the test has none
+
+components:
+  cmd: {in: cmd/*}
+
+deps:
+  cmd:
+    mayDependOn: [cmd]  # a leaf; go-arch-lint rejects an empty list

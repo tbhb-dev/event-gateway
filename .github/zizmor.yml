@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright Tony Burns
+
+---
+# Every action must be pinned to a full commit SHA, not a tag or branch.
+# zizmor's default lets first-party actions use a ref pin; the wildcard here
+# removes that exemption.
+rules:
+  unpinned-uses:
+    config:
+      policies:
+        "*": hash-pin
+  # tbhb-dev/renovate-config is pinned by commit to its main branch, which has
+  # no release tags by design; Renovate bumps the pins. The two caller
+  # workflows reference it, and ci.yml pins tbhb-dev/rules the same way. Each
+  # move of that branch leaves the `# main` comment naming a newer commit until
+  # Renovate's bump merges, which is Renovate's job to catch, not a failure for
+  # every pull request.
+  stale-action-refs:
+    ignore:
+      - ci.yml
+      - renovate.yaml
+      - renovate-config-validator.yaml
+  ref-version-mismatch:
+    ignore:
+      - ci.yml
+      - renovate.yaml
+      - renovate-config-validator.yaml
