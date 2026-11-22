@@ -1,0 +1,123 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright Tony Burns
+
+---
+# Main quality gate. Bazel pins every tool and owns every gate: the
+# hermetic checks are cached `bazel test` targets, so `bazel test //...`
+# runs them all, and the few that need the network, Git history or the
+# GitHub API run as their own steps after it. A final `conclusion` job gives
+# branch protection one stable required check.
+#
+# Pull requests run Linux (x86_64 and arm64) and Windows. Pushes to main,
+# nightly runs and reusable calls also run macOS (arm64).
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '23 7 * * *'
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Bazel 9.x only, the version .bazelversion pins, on Linux (x86_64 and
+  # arm64), macOS (arm64) and Windows (x86_64). The checks that need the
+  # network or GitHub's API run on Linux only; they do not depend on the OS.
+  bazel:
+    name: "bazel (${{ matrix.os }})"
+    runs-on: ${{ matrix.os }}
+    # macOS gets 75 minutes: on a cold cache its tests alone took 38
+    # minutes.
+    timeout-minutes: ${{ matrix.os == 'macos-26' && 75 || 45 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: >-
+          ${{ fromJSON(github.event_name == 'pull_request' &&
+          '["ubuntu-26.04","ubuntu-26.04-arm","windows-2025"]' ||
+          '["ubuntu-26.04","ubuntu-26.04-arm","macos-26","windows-2025"]') }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # Full history, for the history checks.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      # Hardening (Linux), Bazel and its caches, Windows' Bash, output root
+      # and long paths, Linux arm64's Rust, and the retried fetch of //...
+      - name: Set up Bazel for CI
+        uses: tbhb-dev/rules/.github/actions/setup-bazel-ci@f7328fb4baef6705610ffb972c9cc9822501b09e  # main
+        with:
+          disk-cache: >-
+            ${{ github.event_name == 'push' && matrix.os != 'windows-2025' && 'false' ||
+            format('{0}-{1}', github.workflow, matrix.os) }}
+          cache-save: ${{ github.event_name != 'pull_request' }}
+
+      # //... is every hermetic gate: the whole-tree lint tests (secrets in
+      # the working tree, YAML, TOML, Markdown, prose, EditorConfig,
+      # workflows, shell, CODEOWNERS paths), the format check, Starlark
+      # lint, nogo during the build, the Go tests and linters, the coverage
+      # floors, the REUSE check, the import contracts, and the preset
+      # staleness test.
+      - name: Test
+        run: bazelisk test --config=ci //...
+
+      # A failed run's test logs, so a failure that does not recur can still
+      # be read.
+      - name: Keep the test logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: testlogs-${{ matrix.os }}
+          path: |
+            .bazel-testlogs/**/test.log
+            .bazel-testlogs/**/test.xml
+          # upload-artifact skips dot-prefixed paths otherwise.
+          include-hidden-files: true
+          if-no-files-found: ignore
+
+  # The repository-level checks, on Linux beside the bazel matrix, so they
+  # don't wait behind the tests. rules' reusable workflow runs gazelle, the
+  # MODULE.bazel tidy check, the history scan, the dependency audits, the
+  # Go vulnerability scan, zizmor online and the CODEOWNERS check.
+  repo:
+    name: repo
+    permissions:
+      contents: read
+    uses: tbhb-dev/rules/.github/workflows/repo-checks.yml@f7328fb4baef6705610ffb972c9cc9822501b09e  # main
+    with:
+      timeout-minutes: 10
+      pip-audit-target: ''
+      govulncheck-target: //:govulncheck
+      gazelle-dirs: .
+      module-dirs: .
+
+  # One stable required check for branch protection. `if: always()` runs it
+  # even when a needed job failed. It passes only when every needed job's
+  # result is exactly "success", so a gate that was skipped, cancelled or
+  # never finished cannot pass. A matrix with a cancelled leg reports
+  # "abandoned", not "cancelled", so the check lists what passes, not what
+  # fails.
+  conclusion:
+    name: conclusion
+    if: always()
+    needs: [bazel, repo]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    steps:
+      - name: Fail if any needed job did not succeed
+        uses: tbhb-dev/rules/.github/actions/ci-conclusion@f7328fb4baef6705610ffb972c9cc9822501b09e  # main
+        with:
+          needs: ${{ toJSON(needs) }}
