@@ -184,3 +184,11 @@ xsession
 yosida
 zizmor
 GORACE
+cespare
+logr
+stdr
+metricdata
+metricnoop
+sdkmetric
+tracenoop
+tracetest

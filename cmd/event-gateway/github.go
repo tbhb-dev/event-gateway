@@ -12,7 +12,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"regexp"
 	"strings"
@@ -113,10 +112,10 @@ type githubHead struct {
 }
 
 type githubWebhook struct {
-	store   eventStore
-	logger  *slog.Logger
-	secret  []byte
-	bodyCap int
+	store     eventStore
+	telemetry telemetry
+	secret    []byte
+	bodyCap   int
 }
 
 func (h *githubWebhook) ServeHTTP(response http.ResponseWriter, request *http.Request) {
@@ -126,66 +125,81 @@ func (h *githubWebhook) ServeHTTP(response http.ResponseWriter, request *http.Re
 	case request.Method == http.MethodGet && path == healthPath:
 		response.WriteHeader(http.StatusOK)
 	case request.Method == http.MethodPost && path == webhookPath:
-		status := h.ingest(response, request)
-		if status == http.StatusRequestEntityTooLarge {
-			http.Error(response, "GitHub webhook body exceeds the store limit", status)
-
-			return
-		}
-
-		response.WriteHeader(status)
+		h.receive(response, request)
 	default:
 		http.NotFound(response, request)
 	}
 }
 
-func (h *githubWebhook) ingest(response http.ResponseWriter, request *http.Request) int {
+func (h *githubWebhook) receive(response http.ResponseWriter, request *http.Request) {
+	ctx, span := h.telemetry.tracer.Start(request.Context(), "github webhook")
+	defer span.End()
+
+	event, status := h.ingest(response, request.WithContext(ctx))
+	h.telemetry.record(ctx, span, event, status)
+
+	if status == http.StatusRequestEntityTooLarge {
+		http.Error(response, "GitHub webhook body exceeds the store limit", status)
+
+		return
+	}
+
+	response.WriteHeader(status)
+}
+
+func (h *githubWebhook) ingest(response http.ResponseWriter, request *http.Request) (string, int) {
 	receivedAt := time.Now().UTC()
 	signature := request.Header.Get("X-Hub-Signature-256")
 
+	// The signature covers the body, not the headers, so only a well-formed
+	// event name is recorded.
+	event := request.Header.Get(eventHeader)
+	if !githubEvent.MatchString(event) {
+		event = ""
+	}
+
 	digest, err := decodeSignature(signature)
 	if err != nil {
-		return http.StatusUnauthorized
+		return "", http.StatusUnauthorized
 	}
 
 	body, err := io.ReadAll(http.MaxBytesReader(response, request.Body, maxPayload))
 	if err != nil {
 		_, tooLarge := errors.AsType[*http.MaxBytesError](err)
 		if tooLarge {
-			return http.StatusRequestEntityTooLarge
+			return event, http.StatusRequestEntityTooLarge
 		}
 
-		return http.StatusBadRequest
+		return event, http.StatusBadRequest
 	}
 
 	if !verifySignature(h.secret, body, digest) {
-		return http.StatusUnauthorized
+		return "", http.StatusUnauthorized
 	}
 
-	event := request.Header.Get(eventHeader)
 	delivery := request.Header.Get(deliveryHeader)
 
 	err = validateEvent(event, body)
 	if err != nil {
-		return h.publishStatus(request.Context(), err)
+		return event, h.publishStatus(request.Context(), err)
 	}
 
-	if !githubEvent.MatchString(event) || !githubDelivery.MatchString(delivery) {
-		return http.StatusBadRequest
+	if !githubDelivery.MatchString(delivery) {
+		return event, http.StatusBadRequest
 	}
 
 	normalized, err := normalizeGitHub(event, delivery, receivedAt, body, h.bodyCap)
 	if err != nil {
-		return http.StatusBadRequest
+		return event, http.StatusBadRequest
 	}
 
 	if event == "ping" {
-		return http.StatusAccepted
+		return event, http.StatusAccepted
 	}
 
 	err = h.store.publish(request.Context(), normalized)
 
-	return h.publishStatus(request.Context(), err)
+	return event, h.publishStatus(request.Context(), err)
 }
 
 func (h *githubWebhook) publishStatus(ctx context.Context, err error) int {
@@ -197,11 +211,11 @@ func (h *githubWebhook) publishStatus(ctx context.Context, err error) int {
 	case errors.Is(err, nats.ErrMaxPayload):
 		return http.StatusRequestEntityTooLarge
 	case errors.Is(err, errBodyConflict):
-		h.logger.WarnContext(ctx, "GitHub delivery already has a different body")
+		h.telemetry.logger.WarnContext(ctx, "GitHub delivery already has a different body")
 
 		return http.StatusConflict
 	default:
-		h.logger.ErrorContext(ctx, "GitHub event storage unavailable")
+		h.telemetry.logger.ErrorContext(ctx, "GitHub event storage unavailable")
 
 		return http.StatusServiceUnavailable
 	}

@@ -25,32 +25,6 @@ import (
 
 const issuesEvent = "issues"
 
-func checkError(t *testing.T, err error) {
-	t.Helper()
-
-	if err != nil {
-		t.Fatal(err)
-	}
-}
-
-func checkEqual[T comparable](t *testing.T, got, want T) {
-	t.Helper()
-
-	if got != want {
-		t.Fatalf("got %v, want %v", got, want)
-	}
-}
-
-func testStore(t *testing.T, age time.Duration) eventStore {
-	t.Helper()
-
-	store, stop, err := openStore(t.Context(), storeOptions(t.TempDir()), age)
-	checkError(t, err)
-	t.Cleanup(stop)
-
-	return store
-}
-
 func TestStoreDeliveryDuplicates(t *testing.T) {
 	t.Parallel()
 

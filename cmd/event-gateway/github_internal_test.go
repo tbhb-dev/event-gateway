@@ -11,26 +11,60 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
+	"time"
+
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+
+	metricnoop "go.opentelemetry.io/otel/metric/noop"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	tracenoop "go.opentelemetry.io/otel/trace/noop"
 )
 
 const fixtureKey = "fixture-signing-key"
 
+func checkError(t *testing.T, err error) {
+	t.Helper()
+
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func checkEqual[T comparable](t *testing.T, got, want T) {
+	t.Helper()
+
+	if got != want {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+}
+
+func testStore(t *testing.T, age time.Duration) eventStore {
+	t.Helper()
+
+	store, stop, err := openStore(t.Context(), storeOptions(t.TempDir()), age)
+	checkError(t, err)
+	t.Cleanup(stop)
+
+	return store
+}
+
 func testWebhook(t *testing.T, store eventStore, bodyCap int) *githubWebhook {
 	t.Helper()
 
-	return &githubWebhook{
-		secret:  []byte(fixtureKey),
-		bodyCap: bodyCap,
-		store:   store,
-		logger:  slog.New(slog.DiscardHandler),
-	}
+	signals := newTelemetry(slog.DiscardHandler, tracenoop.NewTracerProvider(), metricnoop.NewMeterProvider())
+
+	return &githubWebhook{secret: []byte(fixtureKey), bodyCap: bodyCap, store: store, telemetry: signals}
 }
 
 func signedRequest(ctx context.Context, event, delivery, body string) *http.Request {
@@ -225,4 +259,115 @@ func brokenBody(r *http.Request) {
 
 func oversizeBody(r *http.Request) {
 	r.Body = io.NopCloser(bytes.NewReader(make([]byte, maxPayload+1)))
+}
+
+func TestGitHubIngestEvent(t *testing.T) {
+	t.Parallel()
+
+	hook := testWebhook(t, testStore(t, retention), defaultBodyCap)
+
+	for _, test := range []struct {
+		edit        func(*http.Request)
+		name, event string
+		delivery    string
+		want        string
+		status      int
+	}{
+		{oversizeBody, "transport limit", issuesEvent, "1", issuesEvent, http.StatusRequestEntityTooLarge},
+		{nil, "missing delivery", issuesEvent, "", issuesEvent, http.StatusBadRequest},
+		{nil, "malformed event", "Issues", "1", "", http.StatusBadRequest},
+		{nil, "accepted", issuesEvent, "ingest-event", issuesEvent, http.StatusAccepted},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			req := signedRequest(t.Context(), test.event, test.delivery, "{}")
+			if test.edit != nil {
+				test.edit(req)
+			}
+
+			event, status := hook.ingest(httptest.NewRecorder(), req)
+			checkEqual(t, event, test.want)
+			checkEqual(t, status, test.status)
+		})
+	}
+}
+
+func TestGitHubTelemetry(t *testing.T) {
+	t.Parallel()
+
+	spans := tracetest.NewSpanRecorder()
+	reader := sdkmetric.NewManualReader()
+
+	var logs bytes.Buffer
+
+	signals := newTelemetry(
+		slog.NewJSONHandler(&logs, nil),
+		sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(spans)),
+		sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)),
+	)
+	hook := &githubWebhook{
+		store:     testStore(t, retention),
+		telemetry: signals,
+		secret:    []byte(fixtureKey),
+		bodyCap:   defaultBodyCap,
+	}
+	badSignature := signedRequest(t.Context(), issuesEvent, "2", "{}")
+	badSignature.Header.Set("X-Hub-Signature-256", "sha256="+strings.Repeat("0", sha256.Size*2))
+
+	oversized := signedRequest(t.Context(), issuesEvent, "3", "{}")
+	oversizeBody(oversized)
+
+	for _, req := range []*http.Request{
+		signedRequest(t.Context(), issuesEvent, "1", "{}"),
+		signedRequest(t.Context(), issuesEvent, "1", `{"text":"raw-payload-fixture"}`),
+		badSignature,
+		oversized,
+		signedRequest(t.Context(), "Issues", "4", "{}"),
+	} {
+		hook.ServeHTTP(httptest.NewRecorder(), req)
+	}
+
+	ended := spans.Ended()
+	got := make([]string, 0, len(ended))
+
+	for _, span := range ended {
+		attrs := span.Attributes()
+		got = append(got, fmt.Sprintf("%s %d", attrs[0].Value.AsString(), attrs[1].Value.AsInt64()))
+	}
+
+	checkEqual(t, strings.Join(got, ","), "issues 202,issues 409, 401,issues 413, 400")
+
+	var metrics metricdata.ResourceMetrics
+	checkError(t, reader.Collect(t.Context(), &metrics))
+
+	counter, ok := metrics.ScopeMetrics[0].Metrics[0].Data.(metricdata.Sum[int64])
+	checkEqual(t, ok, true)
+
+	points := make([]string, 0, len(counter.DataPoints))
+
+	for _, point := range counter.DataPoints {
+		event, _ := point.Attributes.Value("event")
+		status, _ := point.Attributes.Value("http.response.status_code")
+		points = append(points, fmt.Sprintf("%s %d=%d", event.AsString(), status.AsInt64(), point.Value))
+	}
+
+	slices.Sort(points)
+	checkEqual(t, strings.Join(points, ","), " 400=1, 401=1,issues 202=1,issues 409=1,issues 413=1")
+
+	if strings.Contains(logs.String(), "raw-payload-fixture") {
+		t.Fatal("logger received raw payload")
+	}
+}
+
+func TestNewTelemetryNilProviders(t *testing.T) {
+	t.Parallel()
+
+	hook := &githubWebhook{
+		store:     testStore(t, retention),
+		telemetry: newTelemetry(slog.DiscardHandler, nil, nil),
+		secret:    []byte(fixtureKey),
+		bodyCap:   defaultBodyCap,
+	}
+	expectStatus(t, hook.ServeHTTP, signedRequest(t.Context(), issuesEvent, "1", "{}"), http.StatusAccepted)
 }
