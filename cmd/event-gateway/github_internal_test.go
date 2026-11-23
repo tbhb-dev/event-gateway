@@ -11,13 +11,23 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+
+	metricnoop "go.opentelemetry.io/otel/metric/noop"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	tracenoop "go.opentelemetry.io/otel/trace/noop"
 )
 
 const fixtureKey = "fixture-signing-key"
@@ -51,9 +61,7 @@ func testStore(t *testing.T, age time.Duration) eventStore {
 func testWebhook(t *testing.T, store eventStore, bodyCap int) *githubWebhook {
 	t.Helper()
 
-	signals, err := openTelemetry(t.Context(), io.Discard)
-	checkError(t, err)
-	t.Cleanup(func() { signals.close(t.Context()) })
+	signals := newTelemetry(slog.DiscardHandler, tracenoop.NewTracerProvider(), metricnoop.NewMeterProvider())
 
 	return &githubWebhook{secret: []byte(fixtureKey), bodyCap: bodyCap, store: store, telemetry: signals}
 }
@@ -281,5 +289,54 @@ func TestGitHubIngestEvent(t *testing.T) {
 			checkEqual(t, event, test.want)
 			checkEqual(t, status, test.status)
 		})
+	}
+}
+
+func TestGitHubTelemetry(t *testing.T) {
+	t.Parallel()
+
+	spans := tracetest.NewSpanRecorder()
+	reader := sdkmetric.NewManualReader()
+
+	var logs bytes.Buffer
+
+	signals := newTelemetry(
+		slog.NewJSONHandler(&logs, nil),
+		sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(spans)),
+		sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)),
+	)
+	hook := &githubWebhook{
+		store:     testStore(t, retention),
+		telemetry: signals,
+		secret:    []byte(fixtureKey),
+		bodyCap:   defaultBodyCap,
+	}
+	expectStatus(t, hook.ServeHTTP, signedRequest(t.Context(), issuesEvent, "1", "{}"), http.StatusAccepted)
+	expectStatus(
+		t,
+		hook.ServeHTTP,
+		signedRequest(t.Context(), issuesEvent, "1", `{"text":"raw-payload-fixture"}`),
+		http.StatusConflict,
+	)
+
+	ended := spans.Ended()
+	got := make([]string, 0, len(ended))
+
+	for _, span := range ended {
+		attrs := span.Attributes()
+		got = append(got, fmt.Sprintf("%s %d", attrs[0].Value.AsString(), attrs[1].Value.AsInt64()))
+	}
+
+	checkEqual(t, strings.Join(got, ","), "issues 202,issues 409")
+
+	var metrics metricdata.ResourceMetrics
+	checkError(t, reader.Collect(t.Context(), &metrics))
+
+	counter, ok := metrics.ScopeMetrics[0].Metrics[0].Data.(metricdata.Sum[int64])
+	checkEqual(t, ok, true)
+	checkEqual(t, len(counter.DataPoints), 2)
+
+	if strings.Contains(logs.String(), "raw-payload-fixture") {
+		t.Fatal("logger received raw payload")
 	}
 }

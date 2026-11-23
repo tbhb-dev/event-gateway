@@ -16,7 +16,7 @@ vendors:
   nats:
     in: [github.com/nats-io/nats-server/v2/**, github.com/nats-io/nats.go, github.com/nats-io/nats.go/**]
   telemetry:
-    in: [go.opentelemetry.io/otel, go.opentelemetry.io/otel/**, go.opentelemetry.io/contrib/bridges/otelslog]
+    in: [go.opentelemetry.io/otel, go.opentelemetry.io/otel/**]
 
 deps:
   cmd:

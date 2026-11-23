@@ -18,8 +18,6 @@ buildtag
 cacheinfo
 cand
 capsys
-cenkalti
-cespare
 cicd
 cmdlines
 cocogitto
@@ -49,7 +47,6 @@ flatmap
 frontmatter
 fsfe
 funlen
-genproto
 genrule
 gobco
 gochecknoglobals
@@ -91,7 +88,6 @@ listy
 LLMX
 localmodule
 lockfiles
-logr
 mapfile
 mapliteral
 mcpsdk
@@ -120,13 +116,6 @@ noremote
 nosandbox
 nosystem
 nuid
-otelslog
-otlplog
-otlploghttp
-otlpmetric
-otlpmetrichttp
-otlptrace
-otlptracehttp
 owenlamont
 paralleltest
 perfsprint
@@ -147,8 +136,6 @@ runfile
 runfiles
 rylignore
 sandboxed
-sdklog
-sdkmetric
 segmentio
 sess
 sessionstart
@@ -161,7 +148,6 @@ sloglint
 srcs
 stampable
 starlark
-stdr
 strconcat
 strerror
 subagentstart
@@ -198,3 +184,11 @@ xsession
 yosida
 zizmor
 GORACE
+cespare
+logr
+stdr
+metricdata
+metricnoop
+sdkmetric
+tracenoop
+tracetest
