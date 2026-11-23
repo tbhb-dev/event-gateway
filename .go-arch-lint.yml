@@ -15,8 +15,10 @@ components:
 vendors:
   nats:
     in: [github.com/nats-io/nats-server/v2/**, github.com/nats-io/nats.go, github.com/nats-io/nats.go/**]
+  telemetry:
+    in: [go.opentelemetry.io/otel, go.opentelemetry.io/otel/**, go.opentelemetry.io/contrib/bridges/otelslog]
 
 deps:
   cmd:
     mayDependOn: [cmd]  # a leaf; go-arch-lint rejects an empty list
-    canUse: [nats]
+    canUse: [nats, telemetry]

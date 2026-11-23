@@ -12,7 +12,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"regexp"
 	"strings"
@@ -106,10 +105,10 @@ type githubHead struct {
 }
 
 type githubWebhook struct {
-	store   eventStore
-	logger  *slog.Logger
-	secret  []byte
-	bodyCap int
+	store     eventStore
+	telemetry telemetry
+	secret    []byte
+	bodyCap   int
 }
 
 func (h *githubWebhook) ServeHTTP(response http.ResponseWriter, request *http.Request) {
@@ -119,55 +118,64 @@ func (h *githubWebhook) ServeHTTP(response http.ResponseWriter, request *http.Re
 	case request.Method == http.MethodGet && path == healthPath:
 		response.WriteHeader(http.StatusOK)
 	case request.Method == http.MethodPost && path == webhookPath:
-		response.WriteHeader(h.ingest(response, request))
+		h.receive(response, request)
 	default:
 		http.NotFound(response, request)
 	}
 }
 
-func (h *githubWebhook) ingest(response http.ResponseWriter, request *http.Request) int {
+func (h *githubWebhook) receive(response http.ResponseWriter, request *http.Request) {
+	ctx, span := h.telemetry.tracer.Start(request.Context(), "github webhook")
+	defer span.End()
+
+	event, status := h.ingest(response, request.WithContext(ctx))
+	h.telemetry.record(ctx, span, event, status)
+	response.WriteHeader(status)
+}
+
+func (h *githubWebhook) ingest(response http.ResponseWriter, request *http.Request) (string, int) {
 	receivedAt := time.Now().UTC()
 	signature := request.Header.Get("X-Hub-Signature-256")
 
 	digest, err := decodeSignature(signature)
 	if err != nil {
-		return http.StatusUnauthorized
+		return "", http.StatusUnauthorized
 	}
 
 	body, err := io.ReadAll(http.MaxBytesReader(response, request.Body, maxGitHubBody))
 	if err != nil {
 		_, tooLarge := errors.AsType[*http.MaxBytesError](err)
 		if tooLarge {
-			return http.StatusRequestEntityTooLarge
+			return "", http.StatusRequestEntityTooLarge
 		}
 
-		return http.StatusBadRequest
+		return "", http.StatusBadRequest
 	}
 
 	if !verifySignature(h.secret, body, digest) {
-		return http.StatusUnauthorized
+		return "", http.StatusUnauthorized
 	}
 
 	event := request.Header.Get(eventHeader)
 	delivery := request.Header.Get(deliveryHeader)
 
 	if !githubEvent.MatchString(event) || !githubDelivery.MatchString(delivery) {
-		return http.StatusBadRequest
+		return "", http.StatusBadRequest
 	}
 
 	normalized, err := normalizeGitHub(event, delivery, receivedAt, body, h.bodyCap)
 	if err != nil {
-		return http.StatusBadRequest
+		return event, http.StatusBadRequest
 	}
 
 	if event == "ping" {
-		return http.StatusAccepted
+		return event, http.StatusAccepted
 	}
 
 	hash := sha256.Sum256(body)
 	err = h.store.publish(request.Context(), normalized, hex.EncodeToString(hash[:]))
 
-	return h.publishStatus(request.Context(), err)
+	return event, h.publishStatus(request.Context(), err)
 }
 
 func (h *githubWebhook) publishStatus(ctx context.Context, err error) int {
@@ -175,11 +183,11 @@ func (h *githubWebhook) publishStatus(ctx context.Context, err error) int {
 	case err == nil:
 		return http.StatusAccepted
 	case errors.Is(err, errBodyConflict):
-		h.logger.WarnContext(ctx, "GitHub delivery already has a different body")
+		h.telemetry.logger.WarnContext(ctx, "GitHub delivery already has a different body")
 
 		return http.StatusConflict
 	default:
-		h.logger.ErrorContext(ctx, "GitHub event storage unavailable")
+		h.telemetry.logger.ErrorContext(ctx, "GitHub event storage unavailable")
 
 		return http.StatusServiceUnavailable
 	}
