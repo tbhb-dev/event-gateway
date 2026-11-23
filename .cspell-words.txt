@@ -1,6 +1,7 @@
 # Project vocabulary for cspell: tool, command and package names that
 # the bundled dictionaries lack. Add only real terms; fix typos instead.
 addopts
+antithesishq
 ascm
 autouse
 event-gateway
@@ -71,13 +72,16 @@ heapdump
 heredocs
 hermeticity
 hibernatable
+highwayhash
 HKLM
 hprof
 importlinter
 importpath
 inconshreveable
 ireturn
+jetstream
 keepends
+klauspost
 knip
 listy
 LLMX
@@ -97,6 +101,7 @@ nakedret
 nbbbb
 ncccc
 nilfunc
+nkeys
 nobuild
 nocache
 nocmd
@@ -109,6 +114,7 @@ nonstrings
 noremote
 nosandbox
 nosystem
+nuid
 owenlamont
 paralleltest
 perfsprint
