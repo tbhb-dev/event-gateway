@@ -218,7 +218,8 @@ func TestStoreRejectsInvalidDirectory(t *testing.T) {
 
 	_, stop, err := startStore(t.Context(), embedded, retention, time.Second)
 	checkEqual(t, errors.Is(err, errNATSNotReady), true)
-	checkEqual(t, len(err.Error()) > len(errNATSNotReady.Error())+2, true) // the server's cause is attached; its wording varies by OS
+	// The server's cause is attached; its wording varies by OS.
+	checkEqual(t, len(err.Error()) > len(errNATSNotReady.Error())+2, true)
 	checkEqual(t, stop == nil, true)
 	checkEqual(t, embedded.Running(), false)
 }
