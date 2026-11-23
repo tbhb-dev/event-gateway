@@ -18,8 +18,6 @@ import (
 	"time"
 )
 
-const defaultBodyCap = 5 << 20
-
 const maxGitHubBody = 25 << 20
 
 const (

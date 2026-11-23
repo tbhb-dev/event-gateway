@@ -46,7 +46,8 @@ func checkEqual[T comparable](t *testing.T, got, want T) {
 func testStore(t *testing.T, age time.Duration) eventStore {
 	t.Helper()
 
-	store, stop, err := openStore(t.Context(), storeOptions(t.TempDir()), age)
+	cfg := serveConfig{storeDir: t.TempDir()} //nolint:exhaustruct_v5 // Other server options use defaults.
+	store, stop, err := openStore(t.Context(), storeOptions(cfg), age)
 	checkError(t, err)
 	t.Cleanup(stop)
 

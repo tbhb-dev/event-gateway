@@ -69,7 +69,7 @@ func TestOTLP(t *testing.T) {
 	}
 }
 
-func TestOTLPConfigError(t *testing.T) {
+func TestServeOTLPConfigError(t *testing.T) {
 	collector := httptest.NewTLSServer(http.NotFoundHandler())
 	t.Cleanup(collector.Close)
 
@@ -83,7 +83,7 @@ func TestOTLPConfigError(t *testing.T) {
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:4318")
 	t.Setenv("OTEL_EXPORTER_OTLP_CERTIFICATE", file)
 
-	_, err := openTelemetry(t.Context(), io.Discard)
+	err := run(t.Context(), io.Discard, serveArgs(t, "127.0.0.1:0"))
 	if err == nil {
 		t.Fatal("OTLP accepted plaintext with a TLS certificate")
 	}

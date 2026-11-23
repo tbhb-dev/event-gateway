@@ -5,6 +5,7 @@ package main
 
 import (
 	"errors"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -65,8 +66,9 @@ func TestStoreStartupErrors(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
+	cfg := serveConfig{storeDir: dir} //nolint:exhaustruct_v5 // Other server options use defaults.
 
-	options := storeOptions(dir)
+	options := storeOptions(cfg)
 	options.MaxPending = 1
 
 	_, _, err := openStore(t.Context(), options, retention)
@@ -74,12 +76,12 @@ func TestStoreStartupErrors(t *testing.T) {
 		t.Fatal("NATS accepted invalid startup options")
 	}
 
-	_, _, err = openStore(t.Context(), storeOptions(dir), time.Nanosecond)
+	_, _, err = openStore(t.Context(), storeOptions(cfg), time.Nanosecond)
 	if err == nil {
 		t.Fatal("JetStream accepted an invalid duplicate window")
 	}
 
-	srv, err := server.NewServer(storeOptions(dir))
+	srv, err := server.NewServer(storeOptions(cfg))
 	checkError(t, err)
 	srv.Shutdown()
 
@@ -89,13 +91,13 @@ func TestStoreStartupErrors(t *testing.T) {
 	}
 }
 
-func TestStoreRejectsInvalidDirectory(t *testing.T) {
+func TestServeRejectsInvalidStore(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
 	file := filepath.Join(dir, "storage")
-	checkError(t, os.WriteFile(file, []byte("data"), 0o600))
+	checkError(t, os.WriteFile(file, []byte(fixtureKey), 0o600))
 
-	_, _, err := openStore(t.Context(), storeOptions(file), retention)
+	err := serve(t.Context(), io.Discard, []string{"-github-secret-file", file, "-store-dir", file})
 	checkEqual(t, errors.Is(err, errNATSNotReady), true)
 }

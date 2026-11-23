@@ -15,7 +15,6 @@ import (
 )
 
 const (
-	retention     = 7 * 24 * time.Hour
 	maxPayload    = 6 << 20
 	natsReadyWait = 5 * time.Second
 	expiryRetry   = 100 * time.Millisecond
@@ -33,14 +32,16 @@ type eventStore struct {
 	stream jetstream.Stream
 }
 
-func storeOptions(storeDir string) *server.Options {
+func storeOptions(cfg serveConfig) *server.Options {
 	//nolint:exhaustruct_v5 // The embedded server uses NATS defaults for the other options.
 	return &server.Options{
-		JetStream:  true,
-		StoreDir:   storeDir,
-		DontListen: true,
-		SyncAlways: true,
-		MaxPayload: maxPayload,
+		JetStream:          true,
+		StoreDir:           cfg.storeDir,
+		DontListen:         true,
+		SyncAlways:         true,
+		MaxPayload:         maxPayload,
+		JetStreamMaxMemory: cfg.maxMemory,
+		JetStreamMaxStore:  cfg.maxStore,
 	}
 }
 

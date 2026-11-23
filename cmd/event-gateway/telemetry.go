@@ -10,7 +10,6 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"time"
 
 	"go.opentelemetry.io/contrib/bridges/otelslog"
 	"go.opentelemetry.io/otel"
@@ -27,10 +26,7 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
 
-const (
-	serviceName     = "event-gateway"
-	shutdownTimeout = 10 * time.Second
-)
+const serviceName = "event-gateway"
 
 type telemetry struct {
 	logger   *slog.Logger
