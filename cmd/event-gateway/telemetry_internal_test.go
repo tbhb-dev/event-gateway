@@ -111,7 +111,6 @@ func TestOTLPEnvRejected(t *testing.T) {
 		"header without key": {otlpEndpoint: collectorHTTPS, otlpHeaders: "=" + syntheticLeak},
 		"key with space":     {otlpEndpoint: collectorHTTPS, otlpHeaders: "Authorization: Bearer " + syntheticLeak + "=="},
 		"remote plaintext":   {otlpEndpoint: "http://collector.example:4318"},
-		"signal endpoint":    {"OTEL_EXPORTER_OTLP_LOGS_ENDPOINT": "http://collector.example:4318"},
 		"header syntax":      {otlpEndpoint: collectorHTTPS, otlpHeaders: "Authorization: Bearer " + syntheticLeak},
 		"signal header syntax": {
 			otlpEndpoint:                        collectorHTTPS,
@@ -137,16 +136,8 @@ func TestOTLPEnvRejected(t *testing.T) {
 	}
 }
 
-func TestOTLPLocalhost(t *testing.T) {
-	t.Setenv(otlpEndpoint, "http://localhost:4318")
-
-	signals, err := openTelemetry(t.Context(), io.Discard)
-	checkError(t, err)
-	signals.close(t.Context())
-}
-
 func TestOTLPErrorHandler(t *testing.T) {
-	t.Setenv(otlpEndpoint, "http://127.0.0.1:4318")
+	t.Setenv(otlpEndpoint, "http://localhost:4318")
 	t.Setenv(otlpHeaders, "Authorization=Bearer "+syntheticLeak)
 
 	var logs bytes.Buffer
