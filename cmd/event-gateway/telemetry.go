@@ -9,7 +9,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/netip"
+	"net/url"
 	"os"
+	"strings"
+	"sync"
 	"time"
 
 	"go.opentelemetry.io/contrib/bridges/otelslog"
@@ -27,6 +31,11 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
 
+var (
+	errOTLPEndpoint = errors.New("must be an https URL, or an http URL on a loopback host")
+	errOTLPHeaders  = errors.New("must be comma-separated key=value pairs")
+)
+
 const (
 	serviceName     = "event-gateway"
 	shutdownTimeout = 10 * time.Second
@@ -41,17 +50,29 @@ type telemetry struct {
 
 func openTelemetry(ctx context.Context, out io.Writer) (telemetry, error) {
 	handler := slog.NewJSONHandler(out, nil)
-	if os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT") == "" {
+
+	enabled, err := checkOTLPEnv()
+	if err != nil {
+		return telemetry{}, err
+	}
+
+	if !enabled {
 		return newTelemetry(handler, otel.GetTracerProvider(), otel.GetMeterProvider(), func(context.Context) error {
 			return nil
 		}), nil
 	}
 
+	// The SDK's default handler prints the error text, which can carry exporter
+	// settings such as header values.
+	otel.SetErrorHandler(otel.ErrorHandlerFunc(func(error) {
+		slog.New(handler).ErrorContext(ctx, "OTLP export failed")
+	}))
+
 	traceExporter, traceErr := otlptracehttp.New(ctx)
 	metricExporter, metricErr := otlpmetrichttp.New(ctx)
 	logExporter, logErr := otlploghttp.New(ctx)
 
-	err := errors.Join(traceErr, metricErr, logErr)
+	err = errors.Join(traceErr, metricErr, logErr)
 	if err != nil {
 		return telemetry{}, fmt.Errorf("configure OTLP exporters: %w", err)
 	}
@@ -68,9 +89,86 @@ func openTelemetry(ctx context.Context, out io.Writer) (telemetry, error) {
 	)
 	both := slog.NewMultiHandler(handler, otelslog.NewHandler(serviceName, otelslog.WithLoggerProvider(logger)))
 
+	var (
+		once        sync.Once
+		shutdownErr error
+	)
+
 	return newTelemetry(both, tracer, meter, func(ctx context.Context) error {
-		return errors.Join(tracer.Shutdown(ctx), meter.Shutdown(ctx), logger.Shutdown(ctx))
+		once.Do(func() {
+			shutdownErr = errors.Join(tracer.Shutdown(ctx), meter.Shutdown(ctx), logger.Shutdown(ctx))
+		})
+
+		return shutdownErr
 	}), nil
+}
+
+// checkOTLPEnv reports whether any OTLP endpoint is set, and rejects settings
+// that could send or print a credential. Errors name the variable, never its
+// value.
+func checkOTLPEnv() (bool, error) {
+	var errs []error
+
+	enabled := false
+
+	for _, signal := range []string{"", "TRACES_", "METRICS_", "LOGS_"} {
+		name := "OTEL_EXPORTER_OTLP_" + signal + "ENDPOINT"
+
+		endpoint := os.Getenv(name)
+		if endpoint != "" {
+			enabled = true
+
+			if !secureEndpoint(endpoint) {
+				errs = append(errs, fmt.Errorf("%s %w", name, errOTLPEndpoint))
+			}
+		}
+
+		name = "OTEL_EXPORTER_OTLP_" + signal + "HEADERS"
+		if !validHeaders(os.Getenv(name)) {
+			errs = append(errs, fmt.Errorf("%s %w", name, errOTLPHeaders))
+		}
+	}
+
+	return enabled, errors.Join(errs...)
+}
+
+func secureEndpoint(endpoint string) bool {
+	parsed, err := url.Parse(endpoint)
+	if err != nil || parsed.Host == "" {
+		return false
+	}
+
+	if parsed.Scheme == "https" {
+		return true
+	}
+
+	host := parsed.Hostname()
+	if parsed.Scheme != "http" {
+		return false
+	}
+
+	addr, err := netip.ParseAddr(host)
+
+	return host == "localhost" || (err == nil && addr.IsLoopback())
+}
+
+// validHeaders rejects HTTP header syntax such as "Authorization: Bearer ...",
+// which the SDK would print instead of sending.
+func validHeaders(headers string) bool {
+	if headers == "" {
+		return true
+	}
+
+	for pair := range strings.SplitSeq(headers, ",") {
+		key, _, found := strings.Cut(pair, "=")
+
+		key = strings.TrimSpace(key)
+		if !found || key == "" || strings.ContainsAny(key, " \t:") {
+			return false
+		}
+	}
+
+	return true
 }
 
 func newTelemetry(

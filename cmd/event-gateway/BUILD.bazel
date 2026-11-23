@@ -56,5 +56,6 @@ go_test(
         "@com_github_nats_io_nats_go//:nats_go",
         "@com_github_nats_io_nats_go//jetstream",
         "@com_github_nats_io_nats_server_v2//server",
+        "@io_opentelemetry_go_otel//:otel",
     ],
 )
