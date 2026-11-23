@@ -73,6 +73,7 @@ func TestStoreDeliveryDuplicates(t *testing.T) {
 		Repository: &repository,
 		ReceivedAt: received.Format(time.RFC3339Nano),
 		Payload:    []byte(body),
+		projected:  nil,
 	}
 	checkError(t, store.publish(ctx, message))
 	checkError(t, store.publish(ctx, message))
@@ -146,6 +147,7 @@ func TestEventExpiry(t *testing.T) {
 		Repository: nil,
 		ReceivedAt: time.Now().UTC().Format(time.RFC3339Nano),
 		Payload:    []byte("{}"),
+		projected:  nil,
 	}
 	checkError(t, store.publish(ctx, message))
 

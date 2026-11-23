@@ -31,6 +31,7 @@ go_binary(
 go_test(
     name = "event-gateway_test",
     srcs = [
+        "github_internal_test.go",
         "main_internal_test.go",
         "store_internal_test.go",
     ],
