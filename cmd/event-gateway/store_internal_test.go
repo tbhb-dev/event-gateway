@@ -3,6 +3,8 @@
 
 package main
 
+// cspell:words synctest
+
 import (
 	"context"
 	"crypto/sha256"
@@ -11,13 +13,17 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
+
+const issuesEvent = "issues"
 
 func checkError(t *testing.T, err error) {
 	t.Helper()
@@ -54,7 +60,7 @@ func TestStoreDeliveryDuplicates(t *testing.T) {
 	const (
 		event    = "pull_request"
 		delivery = "delivery-1"
-		body     = `{ "repository": {"full_name": "example/repository"}, "action": "opened", "text": "<example>" }`
+		body     = "\t\n" + `{ "repository": {"full_name": "example/repository"}, "action": "opened" }` + "\r\n"
 	)
 
 	repository := "example/repository"
@@ -68,18 +74,18 @@ func TestStoreDeliveryDuplicates(t *testing.T) {
 		ReceivedAt: received.Format(time.RFC3339Nano),
 		Payload:    []byte(body),
 	}
-	hash := sha256.Sum256(message.Payload)
-	digest := hex.EncodeToString(hash[:])
-	checkError(t, store.publish(ctx, message, digest))
-	checkError(t, store.publish(ctx, message, digest))
+	checkError(t, store.publish(ctx, message))
+	checkError(t, store.publish(ctx, message))
 
-	changed := sha256.Sum256([]byte(body + " "))
-	err := store.publish(ctx, message, hex.EncodeToString(changed[:]))
+	changed := message
+	changed.Payload = []byte(body + " ")
+	err := store.publish(ctx, changed)
 	checkEqual(t, errors.Is(err, errBodyConflict), true)
 
 	info, err := store.stream.Info(ctx)
 	checkError(t, err)
 	checkEqual(t, info.State.Msgs, uint64(1))
+	checkEqual(t, info.Config.Storage, jetstream.FileStorage)
 	checkEqual(t, info.Config.MaxAge, retention)
 	checkEqual(t, info.Config.Duplicates, retention)
 
@@ -89,7 +95,8 @@ func TestStoreDeliveryDuplicates(t *testing.T) {
 	checkEqual(t, msg.Subject, "events.github.pull_request")
 	checkEqual(t, msg.Header.Get(nats.MsgIdHdr), "github:"+delivery)
 
-	checkEqual(t, msg.Header.Get(bodyHashKey), digest)
+	hash := sha256.Sum256(message.Payload)
+	checkEqual(t, msg.Header.Get(bodyHashKey), hex.EncodeToString(hash[:]))
 
 	var stored map[string]json.RawMessage
 	checkError(t, json.Unmarshal(msg.Data, &stored))
@@ -99,7 +106,11 @@ func TestStoreDeliveryDuplicates(t *testing.T) {
 	checkEqual(t, string(stored["event"]), `"pull_request"`)
 	checkEqual(t, string(stored["delivery"]), `"delivery-1"`)
 	checkEqual(t, string(stored["repository"]), `"example/repository"`)
-	checkEqual(t, string(stored["payload"]), body)
+	checkEqual(t, string(stored["payload"]), strings.TrimSpace(body))
+
+	_, encodedPayload, found := strings.Cut(string(msg.Data), `,"payload":`)
+	checkEqual(t, found, true)
+	checkEqual(t, encodedPayload, body+"}")
 
 	var receivedAt time.Time
 	checkError(t, json.Unmarshal(stored["received_at"], &receivedAt))
@@ -107,13 +118,13 @@ func TestStoreDeliveryDuplicates(t *testing.T) {
 
 	checkError(t, store.stream.DeleteMsg(ctx, msg.Sequence))
 
-	err = store.publish(ctx, message, digest)
+	err = store.publish(ctx, message)
 	checkEqual(t, errors.Is(err, jetstream.ErrMsgNotFound), true)
 
 	canceled, cancel := context.WithCancel(ctx)
 	cancel()
 
-	err = store.publish(canceled, message, digest)
+	err = store.publish(canceled, message)
 	checkEqual(t, errors.Is(err, context.Canceled), true)
 }
 
@@ -130,14 +141,13 @@ func TestEventExpiry(t *testing.T) {
 	message := envelope{
 		Type:       "event",
 		Provider:   "github",
-		Event:      "issues",
+		Event:      issuesEvent,
 		Delivery:   delivery,
 		Repository: nil,
 		ReceivedAt: time.Now().UTC().Format(time.RFC3339Nano),
 		Payload:    []byte("{}"),
 	}
-	hash := sha256.Sum256(message.Payload)
-	checkError(t, store.publish(ctx, message, hex.EncodeToString(hash[:])))
+	checkError(t, store.publish(ctx, message))
 
 	deadline := time.Now().Add(5 * time.Second)
 
@@ -160,8 +170,7 @@ func TestEventExpiry(t *testing.T) {
 	checkEqual(t, errors.Is(err, jetstream.ErrMsgNotFound), true)
 
 	message.Payload = []byte(`{"action":"opened"}`)
-	hash = sha256.Sum256(message.Payload)
-	checkError(t, store.publish(ctx, message, hex.EncodeToString(hash[:])))
+	checkError(t, store.publish(ctx, message))
 
 	msg, err := store.stream.GetMsg(ctx, 2)
 	checkError(t, err)
@@ -174,16 +183,13 @@ func TestStoreStartupErrors(t *testing.T) {
 	dir := t.TempDir()
 
 	options := storeOptions(dir)
+	checkEqual(t, options.NoSigs, true)
+	checkEqual(t, options.SyncAlways, true)
 	options.MaxPending = 1
 
 	_, _, err := openStore(t.Context(), options, retention)
 	if err == nil {
 		t.Fatal("NATS accepted invalid startup options")
-	}
-
-	_, _, err = openStore(t.Context(), storeOptions(dir), time.Nanosecond)
-	if err == nil {
-		t.Fatal("JetStream accepted an invalid duplicate window")
 	}
 
 	srv, err := server.NewServer(storeOptions(dir))
@@ -203,6 +209,126 @@ func TestStoreRejectsInvalidDirectory(t *testing.T) {
 	file := filepath.Join(dir, "storage")
 	checkError(t, os.WriteFile(file, []byte("data"), 0o600))
 
-	_, _, err := openStore(t.Context(), storeOptions(file), retention)
+	_, _, err := openStore(t.Context(), storeOptions(""), retention)
+	checkEqual(t, errors.Is(err, errStoreDir), true)
+
+	embedded, err := server.NewServer(storeOptions(file))
+	checkError(t, err)
+	t.Cleanup(embedded.Shutdown)
+
+	_, stop, err := startStore(t.Context(), embedded, retention, time.Second)
 	checkEqual(t, errors.Is(err, errNATSNotReady), true)
+	checkEqual(t, strings.Contains(err.Error(), "storage directory is not a directory"), true)
+	checkEqual(t, stop == nil, true)
+	checkEqual(t, embedded.Running(), false)
+}
+
+func TestStoreStopsOnStreamError(t *testing.T) {
+	t.Parallel()
+
+	embedded, err := server.NewServer(storeOptions(t.TempDir()))
+	checkError(t, err)
+	t.Cleanup(embedded.Shutdown)
+	embedded.Start()
+
+	conn, err := nats.Connect(nats.DefaultURL, nats.InProcessServer(embedded))
+	checkError(t, err)
+	t.Cleanup(conn.Close)
+
+	_, stop, err := openStream(t.Context(), embedded, conn, time.Nanosecond)
+	if err == nil || !strings.Contains(err.Error(), "configure EVENTS stream") {
+		t.Fatalf("expected a stream configuration error, got %v", err)
+	}
+
+	checkEqual(t, stop == nil, true)
+	checkEqual(t, conn.IsClosed(), true)
+	checkEqual(t, embedded.Running(), false)
+}
+
+func TestStoreRejectsInvalidEvent(t *testing.T) {
+	t.Parallel()
+
+	var store eventStore
+
+	var event envelope
+
+	event.Payload = []byte("{}")
+	for _, name := range []string{
+		"", "issue.comment", "issue*", "issue>", "issue comment", "issue\tcomment", "issue\u00a0comment",
+	} {
+		event.Event = name
+		err := store.publish(t.Context(), event)
+		checkEqual(t, errors.Is(err, errInvalidEvent), true)
+	}
+
+	event.Event = issuesEvent
+	event.Payload = nil
+	err := store.publish(t.Context(), event)
+	checkEqual(t, errors.Is(err, errEmptyPayload), true)
+}
+
+type retryJet struct {
+	jetstream.JetStream
+
+	calls int
+}
+
+func (jet *retryJet) PublishMsg(context.Context, *nats.Msg, ...jetstream.PublishOpt) (*jetstream.PubAck, error) {
+	jet.calls++
+
+	var ack jetstream.PubAck
+
+	ack.Duplicate = jet.calls == 1
+
+	return &ack, nil
+}
+
+type expiredStream struct {
+	jetstream.Stream
+}
+
+func (expiredStream) GetMsg(context.Context, uint64, ...jetstream.GetMsgOpt) (*jetstream.RawStreamMsg, error) {
+	return nil, jetstream.ErrMsgNotFound
+}
+
+func retryFixture(jet *retryJet) (eventStore, envelope) {
+	var stream expiredStream
+
+	var event envelope
+
+	event.Event = issuesEvent
+	event.Payload = []byte("{}")
+
+	return eventStore{jet: jet, stream: stream}, event
+}
+
+func TestStoreRetryAfterExpiry(t *testing.T) {
+	t.Parallel()
+
+	jet := new(retryJet)
+	store, event := retryFixture(jet)
+	checkError(t, store.publish(t.Context(), event))
+	checkEqual(t, jet.calls, 2)
+}
+
+func TestStoreCancelDuringRetryWait(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		jet := new(retryJet)
+		store, event := retryFixture(jet)
+
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		result := make(chan error, 1)
+		go func() {
+			result <- store.publish(ctx, event)
+		}()
+
+		synctest.Wait()
+		cancel()
+		checkEqual(t, errors.Is(<-result, context.Canceled), true)
+		checkEqual(t, jet.calls, 1)
+	})
 }
