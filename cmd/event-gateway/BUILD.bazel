@@ -8,9 +8,18 @@ repo_files()
 
 go_library(
     name = "event-gateway_lib",
-    srcs = ["main.go"],
+    srcs = [
+        "github.go",
+        "main.go",
+        "store.go",
+    ],
     importpath = "go.tbhb.dev/event-gateway/cmd/event-gateway",
     visibility = ["//visibility:private"],
+    deps = [
+        "@com_github_nats_io_nats_go//:nats_go",
+        "@com_github_nats_io_nats_go//jetstream",
+        "@com_github_nats_io_nats_server_v2//server",
+    ],
 )
 
 go_binary(
@@ -21,8 +30,16 @@ go_binary(
 
 go_test(
     name = "event-gateway_test",
-    srcs = ["main_internal_test.go"],
+    srcs = [
+        "main_internal_test.go",
+        "store_internal_test.go",
+    ],
     embed = [":event-gateway_lib"],
     # The whole-module Go checks in the root package take the tests too.
     visibility = ["//:__pkg__"],
+    deps = [
+        "@com_github_nats_io_nats_go//:nats_go",
+        "@com_github_nats_io_nats_go//jetstream",
+        "@com_github_nats_io_nats_server_v2//server",
+    ],
 )

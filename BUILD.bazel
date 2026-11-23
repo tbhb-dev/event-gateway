@@ -33,6 +33,7 @@ load("//tools/lint:linters.bzl", "golangci_lint_test")
 exports_files([
     ".golangci.yml",
     "go.mod",
+    "go.sum",
 ])
 
 gazelle(name = "gazelle")
@@ -110,6 +111,8 @@ govulncheck(
     name = "govulncheck",
     srcs = GO_TARGETS,
     go_mod = "go.mod",
+    go_sum = "go.sum",
+    proxy = "@go_mod_proxy//:proxy",
 )
 
 # Condition coverage: every condition of a package reaches both outcomes, as
@@ -118,6 +121,8 @@ govulncheck(
 gobco_test(
     name = "event-gateway_gobco_test",
     go_mod = "go.mod",
+    go_sum = "go.sum",
+    proxy = "@go_mod_proxy//:proxy",
     tests = ["//cmd/event-gateway:event-gateway_test"],
 )
 
