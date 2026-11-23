@@ -34,6 +34,9 @@ jobs:
   bazel:
     name: "bazel (${{ matrix.os }})"
     runs-on: ${{ matrix.os }}
+    # Pull requests skip macOS: the service has no macOS-specific code (no
+    # darwin build tags or files), so Linux and Windows cover the code paths
+    # and macOS runs on pushes to the default branch.
     # macOS gets 75 minutes: on a cold cache its tests alone took 38
     # minutes.
     timeout-minutes: ${{ matrix.os == 'macos-26' && 75 || 45 }}
