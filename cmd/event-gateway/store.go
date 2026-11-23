@@ -5,9 +5,13 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
+	"unicode"
 
 	"github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
@@ -25,6 +29,9 @@ const (
 
 var (
 	errNATSNotReady = errors.New("embedded NATS did not become ready")
+	errStoreDir     = errors.New("store directory must not be empty")
+	errInvalidEvent = errors.New("event name must be a single subject token without wildcards or whitespace")
+	errEmptyPayload = errors.New("event payload must not be empty")
 	errBodyConflict = errors.New("delivery ID already has a different body")
 )
 
@@ -39,23 +46,62 @@ func storeOptions(storeDir string) *server.Options {
 		JetStream:  true,
 		StoreDir:   storeDir,
 		DontListen: true,
+		NoSigs:     true,
 		SyncAlways: true,
 		MaxPayload: maxPayload,
 	}
 }
 
 func openStore(ctx context.Context, options *server.Options, maxAge time.Duration) (eventStore, func(), error) {
+	if options.StoreDir == "" {
+		return eventStore{}, nil, errStoreDir
+	}
+
 	embedded, err := server.NewServer(options)
 	if err != nil {
 		return eventStore{}, nil, fmt.Errorf("configure embedded NATS: %w", err)
 	}
 
+	return startStore(ctx, embedded, maxAge, natsReadyWait)
+}
+
+// cspell:words Noticef Warnf Debugf Tracef
+
+// startupLog records the first fatal error without exiting the gateway.
+type startupLog chan string
+
+func (startupLog) Noticef(string, ...any) {}
+func (startupLog) Warnf(string, ...any)   {}
+func (startupLog) Errorf(string, ...any)  {}
+func (startupLog) Debugf(string, ...any)  {}
+func (startupLog) Tracef(string, ...any)  {}
+
+func (log startupLog) Fatalf(format string, args ...any) {
+	select {
+	case log <- fmt.Sprintf(format, args...):
+	default:
+	}
+}
+
+func startStore(
+	ctx context.Context,
+	embedded *server.Server,
+	maxAge, readyWait time.Duration,
+) (eventStore, func(), error) {
+	failures := make(startupLog, 1)
+	embedded.SetLogger(failures, false, false)
+
 	go embedded.Start()
 
-	if !embedded.ReadyForConnections(natsReadyWait) {
+	if !embedded.ReadyForConnections(readyWait) {
 		embedded.Shutdown()
 
-		return eventStore{}, nil, errNATSNotReady
+		select {
+		case cause := <-failures:
+			return eventStore{}, nil, fmt.Errorf("%w: %s", errNATSNotReady, cause)
+		default:
+			return eventStore{}, nil, errNATSNotReady
+		}
 	}
 
 	return connectStore(ctx, embedded, maxAge)
@@ -69,22 +115,20 @@ func connectStore(ctx context.Context, embedded *server.Server, maxAge time.Dura
 		return eventStore{}, nil, fmt.Errorf("connect to embedded NATS: %w", err)
 	}
 
+	return openStream(ctx, embedded, conn, maxAge)
+}
+
+func openStream(
+	ctx context.Context,
+	embedded *server.Server,
+	conn *nats.Conn,
+	maxAge time.Duration,
+) (eventStore, func(), error) {
 	closeStore := func() {
 		conn.Close()
 		embedded.Shutdown()
 	}
 
-	store, err := openStream(ctx, conn, maxAge)
-	if err != nil {
-		closeStore()
-
-		return eventStore{}, nil, err
-	}
-
-	return store, closeStore, nil
-}
-
-func openStream(ctx context.Context, conn *nats.Conn, maxAge time.Duration) (eventStore, error) {
 	//nolint:errcheck // JetStream New only returns errors from options.
 	jet, _ := jetstream.New(conn)
 
@@ -98,19 +142,40 @@ func openStream(ctx context.Context, conn *nats.Conn, maxAge time.Duration) (eve
 		Duplicates: maxAge,
 	})
 	if err != nil {
-		return eventStore{}, fmt.Errorf("configure EVENTS stream: %w", err)
+		closeStore()
+
+		return eventStore{}, nil, fmt.Errorf("configure EVENTS stream: %w", err)
 	}
 
-	return eventStore{jet: jet, stream: stream}, nil
+	return eventStore{jet: jet, stream: stream}, closeStore, nil
 }
 
-func (s eventStore) publish(ctx context.Context, event envelope, hash string) error {
+func validateEvent(name string, payload []byte) error {
+	if name == "" || strings.ContainsAny(name, ".*>") || strings.ContainsFunc(name, unicode.IsSpace) {
+		return errInvalidEvent
+	}
+
+	if len(payload) == 0 {
+		return errEmptyPayload
+	}
+
+	return nil
+}
+
+func (s eventStore) publish(ctx context.Context, event envelope) error {
+	err := validateEvent(event.Event, event.Payload)
+	if err != nil {
+		return err
+	}
+
+	sum := sha256.Sum256(event.Payload)
+	hash := hex.EncodeToString(sum[:])
 	msg := nats.NewMsg("events.github." + event.Event)
 	msg.Data = event.encode()
 	msg.Header.Set(nats.MsgIdHdr, "github:"+event.Delivery)
 	msg.Header.Set(bodyHashKey, hash)
 
-	err := s.publishChecked(ctx, msg, hash)
+	err = s.publishChecked(ctx, msg, hash)
 	if !errors.Is(err, jetstream.ErrMsgNotFound) {
 		return err
 	}
