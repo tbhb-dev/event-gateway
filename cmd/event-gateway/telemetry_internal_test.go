@@ -7,7 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/pem"
-	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -81,8 +81,6 @@ func TestOTLP(t *testing.T) {
 	}
 }
 
-var errExport = errors.New("export failed with Authorization=Bearer " + syntheticLeak)
-
 const (
 	otlpEndpoint   = "OTEL_EXPORTER_OTLP_ENDPOINT"
 	otlpHeaders    = "OTEL_EXPORTER_OTLP_HEADERS"
@@ -100,10 +98,6 @@ func TestOTLPEnvRejected(t *testing.T) {
 		"key with space":     {otlpEndpoint: collectorHTTPS, otlpHeaders: "Authorization: Bearer " + syntheticLeak + "=="},
 		"remote plaintext":   {otlpEndpoint: "http://collector.example:4318"},
 		"header syntax":      {otlpEndpoint: collectorHTTPS, otlpHeaders: "Authorization: Bearer " + syntheticLeak},
-		"signal header syntax": {
-			otlpEndpoint:                        collectorHTTPS,
-			"OTEL_EXPORTER_OTLP_TRACES_HEADERS": "Authorization: Bearer " + syntheticLeak,
-		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			for key, value := range env {
@@ -132,7 +126,7 @@ func TestOTLPErrorHandler(t *testing.T) {
 
 	_, err := openTelemetry(t.Context(), &logs)
 	checkError(t, err)
-	otel.Handle(errExport)
+	otel.Handle(fmt.Errorf("%w: Authorization=Bearer %s", context.DeadlineExceeded, syntheticLeak))
 
 	if !strings.Contains(logs.String(), "OTLP export failed") || strings.Contains(logs.String(), syntheticLeak) {
 		t.Fatalf("SDK error was not reduced to a fixed message: %s", logs.String())

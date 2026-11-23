@@ -140,9 +140,9 @@ func secureEndpoint(endpoint string) bool {
 
 	host := parsed.Hostname()
 	addr, err := netip.ParseAddr(host)
-	loopback := host == "localhost" || (err == nil && addr.IsLoopback())
 
-	return parsed.Scheme == "https" || (parsed.Scheme == "http" && loopback)
+	return parsed.Scheme == "https" ||
+		(parsed.Scheme == "http" && (host == "localhost" || (err == nil && addr.IsLoopback())))
 }
 
 // validHeaders rejects HTTP header syntax such as "Authorization: Bearer ...",
