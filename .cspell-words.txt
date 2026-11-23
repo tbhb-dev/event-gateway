@@ -68,6 +68,7 @@ govet
 govulncheck
 gpgsign
 hardwrap
+healthz
 heapdump
 heredocs
 hermeticity

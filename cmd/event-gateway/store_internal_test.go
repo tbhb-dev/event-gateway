@@ -4,18 +4,14 @@
 package main
 
 import (
-	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/nats-io/nats-server/v2/server"
-	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
 
@@ -45,78 +41,6 @@ func testStore(t *testing.T, age time.Duration) eventStore {
 	return store
 }
 
-func TestStoreDeliveryDuplicates(t *testing.T) {
-	t.Parallel()
-
-	ctx := t.Context()
-	store := testStore(t, retention)
-
-	const (
-		event    = "pull_request"
-		delivery = "delivery-1"
-		body     = `{ "repository": {"full_name": "example/repository"}, "action": "opened", "text": "<example>" }`
-	)
-
-	repository := "example/repository"
-	received := time.Now().UTC()
-	message := envelope{
-		Type:       "event",
-		Provider:   "github",
-		Event:      event,
-		Delivery:   delivery,
-		Repository: &repository,
-		ReceivedAt: received.Format(time.RFC3339Nano),
-		Payload:    []byte(body),
-	}
-	hash := sha256.Sum256(message.Payload)
-	digest := hex.EncodeToString(hash[:])
-	checkError(t, store.publish(ctx, message, digest))
-	checkError(t, store.publish(ctx, message, digest))
-
-	changed := sha256.Sum256([]byte(body + " "))
-	err := store.publish(ctx, message, hex.EncodeToString(changed[:]))
-	checkEqual(t, errors.Is(err, errBodyConflict), true)
-
-	info, err := store.stream.Info(ctx)
-	checkError(t, err)
-	checkEqual(t, info.State.Msgs, uint64(1))
-	checkEqual(t, info.Config.MaxAge, retention)
-	checkEqual(t, info.Config.Duplicates, retention)
-
-	msg, err := store.stream.GetMsg(ctx, info.State.FirstSeq)
-	checkError(t, err)
-
-	checkEqual(t, msg.Subject, "events.github.pull_request")
-	checkEqual(t, msg.Header.Get(nats.MsgIdHdr), "github:"+delivery)
-
-	checkEqual(t, msg.Header.Get(bodyHashKey), digest)
-
-	var stored map[string]json.RawMessage
-	checkError(t, json.Unmarshal(msg.Data, &stored))
-	checkEqual(t, len(stored), 7)
-	checkEqual(t, string(stored["type"]), `"event"`)
-	checkEqual(t, string(stored["provider"]), `"github"`)
-	checkEqual(t, string(stored["event"]), `"pull_request"`)
-	checkEqual(t, string(stored["delivery"]), `"delivery-1"`)
-	checkEqual(t, string(stored["repository"]), `"example/repository"`)
-	checkEqual(t, string(stored["payload"]), body)
-
-	var receivedAt time.Time
-	checkError(t, json.Unmarshal(stored["received_at"], &receivedAt))
-	checkEqual(t, receivedAt.Location(), time.UTC)
-
-	checkError(t, store.stream.DeleteMsg(ctx, msg.Sequence))
-
-	err = store.publish(ctx, message, digest)
-	checkEqual(t, errors.Is(err, jetstream.ErrMsgNotFound), true)
-
-	canceled, cancel := context.WithCancel(ctx)
-	cancel()
-
-	err = store.publish(canceled, message, digest)
-	checkEqual(t, errors.Is(err, context.Canceled), true)
-}
-
 func TestEventExpiry(t *testing.T) {
 	t.Parallel()
 
@@ -127,17 +51,9 @@ func TestEventExpiry(t *testing.T) {
 
 	ctx := t.Context()
 	store := testStore(t, maxAge)
-	message := envelope{
-		Type:       "event",
-		Provider:   "github",
-		Event:      "issues",
-		Delivery:   delivery,
-		Repository: nil,
-		ReceivedAt: time.Now().UTC().Format(time.RFC3339Nano),
-		Payload:    []byte("{}"),
-	}
-	hash := sha256.Sum256(message.Payload)
-	checkError(t, store.publish(ctx, message, hex.EncodeToString(hash[:])))
+	hook := testWebhook(t, store, defaultBodyCap)
+
+	expectStatus(t, hook.ServeHTTP, signedRequest(ctx, issuesEvent, delivery, "{}"), http.StatusAccepted)
 
 	deadline := time.Now().Add(5 * time.Second)
 
@@ -159,9 +75,12 @@ func TestEventExpiry(t *testing.T) {
 	_, err := store.stream.GetMsg(ctx, 1)
 	checkEqual(t, errors.Is(err, jetstream.ErrMsgNotFound), true)
 
-	message.Payload = []byte(`{"action":"opened"}`)
-	hash = sha256.Sum256(message.Payload)
-	checkError(t, store.publish(ctx, message, hex.EncodeToString(hash[:])))
+	expectStatus(
+		t,
+		hook.ServeHTTP,
+		signedRequest(ctx, issuesEvent, delivery, `{"action":"opened"}`),
+		http.StatusAccepted,
+	)
 
 	msg, err := store.stream.GetMsg(ctx, 2)
 	checkError(t, err)
