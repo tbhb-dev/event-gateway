@@ -2,8 +2,7 @@
 # Copyright Tony Burns
 
 ---
-# Import contracts. The command is the only package so far, and it imports
-# nothing of the module. Every package must belong to a component.
+# Import contracts. Every package must belong to a component.
 version: 3
 
 allow:
@@ -13,6 +12,13 @@ allow:
 components:
   cmd: {in: cmd/*}
 
+vendors:
+  nats:
+    in: [github.com/nats-io/nats-server/v2/**, github.com/nats-io/nats.go, github.com/nats-io/nats.go/**]
+  telemetry:
+    in: [go.opentelemetry.io/otel, go.opentelemetry.io/otel/**, go.opentelemetry.io/contrib/bridges/otelslog]
+
 deps:
   cmd:
     mayDependOn: [cmd]  # a leaf; go-arch-lint rejects an empty list
+    canUse: [nats, telemetry]

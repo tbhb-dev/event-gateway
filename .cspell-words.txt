@@ -1,6 +1,7 @@
 # Project vocabulary for cspell: tool, command and package names that
 # the bundled dictionaries lack. Add only real terms; fix typos instead.
 addopts
+antithesishq
 ascm
 autouse
 event-gateway
@@ -17,6 +18,8 @@ buildtag
 cacheinfo
 cand
 capsys
+cenkalti
+cespare
 cicd
 cmdlines
 cocogitto
@@ -46,6 +49,7 @@ flatmap
 frontmatter
 fsfe
 funlen
+genproto
 genrule
 gobco
 gochecknoglobals
@@ -67,22 +71,27 @@ govet
 govulncheck
 gpgsign
 hardwrap
+healthz
 heapdump
 heredocs
 hermeticity
 hibernatable
+highwayhash
 HKLM
 hprof
 importlinter
 importpath
 inconshreveable
 ireturn
+jetstream
 keepends
+klauspost
 knip
 listy
 LLMX
 localmodule
 lockfiles
+logr
 mapfile
 mapliteral
 mcpsdk
@@ -97,6 +106,7 @@ nakedret
 nbbbb
 ncccc
 nilfunc
+nkeys
 nobuild
 nocache
 nocmd
@@ -109,6 +119,14 @@ nonstrings
 noremote
 nosandbox
 nosystem
+nuid
+otelslog
+otlplog
+otlploghttp
+otlpmetric
+otlpmetrichttp
+otlptrace
+otlptracehttp
 owenlamont
 paralleltest
 perfsprint
@@ -129,6 +147,8 @@ runfile
 runfiles
 rylignore
 sandboxed
+sdklog
+sdkmetric
 segmentio
 sess
 sessionstart
@@ -141,6 +161,7 @@ sloglint
 srcs
 stampable
 starlark
+stdr
 strconcat
 strerror
 subagentstart
