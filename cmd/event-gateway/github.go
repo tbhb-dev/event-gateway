@@ -151,6 +151,13 @@ func (h *githubWebhook) ingest(response http.ResponseWriter, request *http.Reque
 	receivedAt := time.Now().UTC()
 	signature := request.Header.Get("X-Hub-Signature-256")
 
+	// The signature covers the body, not the headers, so only a well-formed
+	// event name is recorded.
+	event := request.Header.Get(eventHeader)
+	if !githubEvent.MatchString(event) {
+		event = ""
+	}
+
 	digest, err := decodeSignature(signature)
 	if err != nil {
 		return "", http.StatusUnauthorized
@@ -160,17 +167,16 @@ func (h *githubWebhook) ingest(response http.ResponseWriter, request *http.Reque
 	if err != nil {
 		_, tooLarge := errors.AsType[*http.MaxBytesError](err)
 		if tooLarge {
-			return "", http.StatusRequestEntityTooLarge
+			return event, http.StatusRequestEntityTooLarge
 		}
 
-		return "", http.StatusBadRequest
+		return event, http.StatusBadRequest
 	}
 
 	if !verifySignature(h.secret, body, digest) {
 		return "", http.StatusUnauthorized
 	}
 
-	event := request.Header.Get(eventHeader)
 	delivery := request.Header.Get(deliveryHeader)
 
 	err = validateEvent(event, body)
@@ -178,8 +184,8 @@ func (h *githubWebhook) ingest(response http.ResponseWriter, request *http.Reque
 		return event, h.publishStatus(request.Context(), err)
 	}
 
-	if !githubEvent.MatchString(event) || !githubDelivery.MatchString(delivery) {
-		return "", http.StatusBadRequest
+	if !githubDelivery.MatchString(delivery) {
+		return event, http.StatusBadRequest
 	}
 
 	normalized, err := normalizeGitHub(event, delivery, receivedAt, body, h.bodyCap)

@@ -251,3 +251,35 @@ func brokenBody(r *http.Request) {
 func oversizeBody(r *http.Request) {
 	r.Body = io.NopCloser(bytes.NewReader(make([]byte, maxPayload+1)))
 }
+
+func TestGitHubIngestEvent(t *testing.T) {
+	t.Parallel()
+
+	hook := testWebhook(t, testStore(t, retention), defaultBodyCap)
+
+	for _, test := range []struct {
+		edit        func(*http.Request)
+		name, event string
+		delivery    string
+		want        string
+		status      int
+	}{
+		{oversizeBody, "transport limit", issuesEvent, "1", issuesEvent, http.StatusRequestEntityTooLarge},
+		{nil, "missing delivery", issuesEvent, "", issuesEvent, http.StatusBadRequest},
+		{nil, "malformed event", "Issues", "1", "", http.StatusBadRequest},
+		{nil, "accepted", issuesEvent, "ingest-event", issuesEvent, http.StatusAccepted},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			req := signedRequest(t.Context(), test.event, test.delivery, "{}")
+			if test.edit != nil {
+				test.edit(req)
+			}
+
+			event, status := hook.ingest(httptest.NewRecorder(), req)
+			checkEqual(t, event, test.want)
+			checkEqual(t, status, test.status)
+		})
+	}
+}
