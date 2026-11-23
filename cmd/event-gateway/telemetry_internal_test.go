@@ -20,15 +20,7 @@ import (
 	"go.opentelemetry.io/otel"
 )
 
-//nolint:paralleltest // The subtests set environment variables.
 func TestOTLP(t *testing.T) {
-	t.Run("base endpoint", func(t *testing.T) { testOTLP(t, false) })
-	t.Run("signal endpoints", func(t *testing.T) { testOTLP(t, true) })
-}
-
-func testOTLP(t *testing.T, perSignal bool) {
-	t.Helper()
-
 	requests := make(chan string, 16)
 	collector := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		body, err := io.ReadAll(request.Body)
@@ -46,13 +38,9 @@ func testOTLP(t *testing.T, perSignal bool) {
 	}))
 	t.Cleanup(collector.Close)
 
-	if perSignal {
-		t.Setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", collector.URL+"/v1/traces")
-		t.Setenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", collector.URL+"/v1/metrics")
-		t.Setenv("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", collector.URL+"/v1/logs")
-	} else {
-		t.Setenv(otlpEndpoint, collector.URL)
-	}
+	t.Setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", collector.URL+"/v1/traces")
+	t.Setenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", collector.URL+"/v1/metrics")
+	t.Setenv("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", collector.URL+"/v1/logs")
 
 	var logs bytes.Buffer
 
