@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -311,13 +312,21 @@ func TestGitHubTelemetry(t *testing.T) {
 		secret:    []byte(fixtureKey),
 		bodyCap:   defaultBodyCap,
 	}
-	expectStatus(t, hook.ServeHTTP, signedRequest(t.Context(), issuesEvent, "1", "{}"), http.StatusAccepted)
-	expectStatus(
-		t,
-		hook.ServeHTTP,
+	badSignature := signedRequest(t.Context(), issuesEvent, "2", "{}")
+	badSignature.Header.Set("X-Hub-Signature-256", "sha256="+strings.Repeat("0", sha256.Size*2))
+
+	oversized := signedRequest(t.Context(), issuesEvent, "3", "{}")
+	oversizeBody(oversized)
+
+	for _, req := range []*http.Request{
+		signedRequest(t.Context(), issuesEvent, "1", "{}"),
 		signedRequest(t.Context(), issuesEvent, "1", `{"text":"raw-payload-fixture"}`),
-		http.StatusConflict,
-	)
+		badSignature,
+		oversized,
+		signedRequest(t.Context(), "Issues", "4", "{}"),
+	} {
+		hook.ServeHTTP(httptest.NewRecorder(), req)
+	}
 
 	ended := spans.Ended()
 	got := make([]string, 0, len(ended))
@@ -327,16 +336,38 @@ func TestGitHubTelemetry(t *testing.T) {
 		got = append(got, fmt.Sprintf("%s %d", attrs[0].Value.AsString(), attrs[1].Value.AsInt64()))
 	}
 
-	checkEqual(t, strings.Join(got, ","), "issues 202,issues 409")
+	checkEqual(t, strings.Join(got, ","), "issues 202,issues 409, 401,issues 413, 400")
 
 	var metrics metricdata.ResourceMetrics
 	checkError(t, reader.Collect(t.Context(), &metrics))
 
 	counter, ok := metrics.ScopeMetrics[0].Metrics[0].Data.(metricdata.Sum[int64])
 	checkEqual(t, ok, true)
-	checkEqual(t, len(counter.DataPoints), 2)
+
+	points := make([]string, 0, len(counter.DataPoints))
+
+	for _, point := range counter.DataPoints {
+		event, _ := point.Attributes.Value("event")
+		status, _ := point.Attributes.Value("http.response.status_code")
+		points = append(points, fmt.Sprintf("%s %d=%d", event.AsString(), status.AsInt64(), point.Value))
+	}
+
+	slices.Sort(points)
+	checkEqual(t, strings.Join(points, ","), " 400=1, 401=1,issues 202=1,issues 409=1,issues 413=1")
 
 	if strings.Contains(logs.String(), "raw-payload-fixture") {
 		t.Fatal("logger received raw payload")
 	}
+}
+
+func TestNewTelemetryNilProviders(t *testing.T) {
+	t.Parallel()
+
+	hook := &githubWebhook{
+		store:     testStore(t, retention),
+		telemetry: newTelemetry(slog.DiscardHandler, nil, nil),
+		secret:    []byte(fixtureKey),
+		bodyCap:   defaultBodyCap,
+	}
+	expectStatus(t, hook.ServeHTTP, signedRequest(t.Context(), issuesEvent, "1", "{}"), http.StatusAccepted)
 }

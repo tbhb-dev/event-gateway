@@ -10,12 +10,16 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
+
+	metricnoop "go.opentelemetry.io/otel/metric/noop"
+	tracenoop "go.opentelemetry.io/otel/trace/noop"
 )
 
 const serviceName = "event-gateway"
 
 // telemetry carries the logger, tracer and counter the handlers record to.
 // The caller supplies the providers, so nothing here reads the environment.
+// A nil provider falls back to a no-op one.
 type telemetry struct {
 	logger *slog.Logger
 	tracer trace.Tracer
@@ -23,6 +27,14 @@ type telemetry struct {
 }
 
 func newTelemetry(handler slog.Handler, tracer trace.TracerProvider, meter metric.MeterProvider) telemetry {
+	if tracer == nil {
+		tracer = tracenoop.NewTracerProvider()
+	}
+
+	if meter == nil {
+		meter = metricnoop.NewMeterProvider()
+	}
+
 	//nolint:errcheck // The counter name is a valid, fixed instrument name.
 	ingest, _ := meter.Meter(serviceName).Int64Counter("event_gateway_ingest_total")
 
