@@ -84,6 +84,7 @@ GO_TARGETS = [
     "//cmd/event-gateway",
     "//cmd/event-gateway:event-gateway_test",
     "//internal/filter:filter_test",
+    "//internal/routing:routing_test",
 ]
 
 golangci_lint_test(
@@ -133,6 +134,14 @@ gobco_test(
     go_sum = "go.sum",
     proxy = "@go_mod_proxy//:proxy",
     tests = ["//internal/filter:filter_test"],
+)
+
+gobco_test(
+    name = "routing_gobco_test",
+    go_mod = "go.mod",
+    go_sum = "go.sum",
+    proxy = "@go_mod_proxy//:proxy",
+    tests = ["//internal/routing:routing_test"],
 )
 
 # Every file of the repository, for the whole-tree checks below. Each package

@@ -12,6 +12,7 @@ allow:
 components:
   cmd: {in: cmd/*}
   filter: {in: internal/filter}
+  routing: {in: internal/routing}
 
 vendors:
   nats:
@@ -32,3 +33,5 @@ deps:
     canUse: [nats, telemetry]
   filter:
     mayDependOn: [filter]
+  routing:
+    mayDependOn: [routing, filter]
