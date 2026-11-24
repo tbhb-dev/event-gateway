@@ -39,6 +39,7 @@ func healthcheck(ctx context.Context, args []string) error {
 	ctx, cancel := context.WithTimeout(ctx, healthcheckTimeout)
 	defer cancel()
 
+	//nolint:exhaustruct_v5 // The probe URL needs only scheme, host and path.
 	target := url.URL{Scheme: "http", Host: *addr, Path: "/healthz"}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)

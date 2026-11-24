@@ -15,26 +15,29 @@ import (
 func TestHealthcheck(t *testing.T) {
 	t.Parallel()
 
-	ok := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	okServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/healthz" || r.Method != http.MethodGet {
 			w.WriteHeader(http.StatusNotFound)
 		}
 	}))
-	t.Cleanup(ok.Close)
+	t.Cleanup(okServer.Close)
 
 	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = w.Write([]byte("secret-body"))
+		//nolint:errcheck,gosec // The client never reads a failed probe body.
+		w.Write([]byte("secret-body"))
 	}))
 	t.Cleanup(bad.Close)
 
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	var listenConfig net.ListenConfig
+
+	listener, err := listenConfig.Listen(t.Context(), "tcp", "127.0.0.1:0")
 	checkError(t, err)
 
 	closed := listener.Addr().String()
 	checkError(t, listener.Close())
 
-	okAddr := strings.TrimPrefix(ok.URL, "http://")
+	okAddr := strings.TrimPrefix(okServer.URL, "http://")
 	badAddr := strings.TrimPrefix(bad.URL, "http://")
 
 	for _, test := range []struct {
@@ -52,12 +55,17 @@ func TestHealthcheck(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			err := run(t.Context(), &strings.Builder{}, slog.DiscardHandler, append([]string{healthcheckCommand}, test.args...))
-			checkEqual(t, err != nil, test.wantErr)
+			runErr := run(
+				t.Context(),
+				&strings.Builder{},
+				slog.DiscardHandler,
+				append([]string{healthcheckCommand}, test.args...),
+			)
+			checkEqual(t, runErr != nil, test.wantErr)
 
-			if err != nil {
+			if runErr != nil {
 				for _, leak := range []string{okAddr, badAddr, closed, "secret-body"} {
-					checkEqual(t, strings.Contains(err.Error(), leak), false)
+					checkEqual(t, strings.Contains(runErr.Error(), leak), false)
 				}
 			}
 		})
