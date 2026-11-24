@@ -32,6 +32,7 @@ delenv
 depcruise
 depguard
 direnv
+distroless
 docstrings
 dunder
 dupl
@@ -69,6 +70,7 @@ govet
 govulncheck
 gpgsign
 hardwrap
+healthcheck
 healthz
 heapdump
 heredocs

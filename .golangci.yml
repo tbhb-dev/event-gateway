@@ -100,11 +100,12 @@ linters:
     dupl:
       threshold: 30
 
-    # Third-party option structs are built with a few fields by design, and
+    # Third-party and standard-library option structs are built with a few fields by design, and
     # the pattern matches the full path, so each one used is listed here.
     exhaustruct_v5:
       ignore-patterns:
         - 'github\.com/spf13/cobra\.Command$'
+        - 'net/url\.URL$'
 
     funlen:
       lines: 100
