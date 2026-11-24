@@ -20,7 +20,10 @@ import (
 	"time"
 )
 
-const storeDirFlag = "-store-dir="
+const (
+	storeDirFlag   = "-store-dir="
+	testReadListen = "-read-listen=127.0.0.1:0"
+)
 
 func TestRunPrintsVersion(t *testing.T) {
 	t.Parallel()
@@ -53,6 +56,9 @@ func TestServeConfigErrors(t *testing.T) {
 		{errBodyCap, "large cap", []string{serveCommand, "-body-cap=6000000"}},
 		{errStoreLimit, "negative memory", []string{serveCommand, "-jetstream-max-memory=-1"}},
 		{errStoreLimit, "negative disk", []string{serveCommand, "-jetstream-max-store=-1"}},
+		{errReadFlags, "missing read token file flag", []string{serveCommand, testReadListen}},
+		{errReadFlags, "empty read address", []string{serveCommand, "-read-listen=", "-read-token-file=tokens"}},
+		{os.ErrNotExist, "missing read token file", []string{serveCommand, testReadListen, "-read-token-file=missing"}},
 		{errServeFlags, "header without separator", []string{serveCommand, "-otlp-header=Authorization"}},
 		{errServeFlags, "empty header name", []string{serveCommand, "-otlp-header==value"}},
 		{errStoreDir, "store directory", []string{serveCommand, storeDirFlag}},
@@ -174,8 +180,14 @@ func exerciseServe(t *testing.T, collectorFlags []string) {
 	file := filepath.Join(dir, "secret")
 	checkError(t, os.WriteFile(file, []byte(fixtureKey+"\r\n"), 0o600))
 
+	tokens := filepath.Join(dir, "tokens")
+	writeReadTokens(t, tokens, "reader", readFixture)
+
 	args := append(
-		[]string{serveCommand, "-listen=" + address, storeDirFlag + dir, "-github-secret-file=" + file},
+		[]string{
+			serveCommand, "-listen=" + address, storeDirFlag + dir, "-github-secret-file=" + file,
+			testReadListen, "-read-token-file=" + tokens,
+		},
 		collectorFlags...,
 	)
 

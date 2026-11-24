@@ -23,6 +23,11 @@ const (
 	writeTimeout    = 30 * time.Second
 )
 
+const (
+	readListenFlag    = "read-listen"
+	readTokenFileFlag = "read-token-file"
+)
+
 var (
 	errUsage      = errors.New("usage: event-gateway serve [flags]")
 	errServeFlags = errors.New("invalid serve flags (see event-gateway serve -help)")
@@ -30,10 +35,14 @@ var (
 	errStoreLimit = errors.New("JetStream limits must be nonnegative")
 )
 
+var errReadFlags = errors.New("read API requires both -read-listen and -read-token-file")
+
 type serveConfig struct {
 	otlp       otlpConfig
 	secret     *string
 	secretFile *string
+	readListen string
+	tokenFile  string
 	listen     string
 	storeDir   string
 	bodyCap    int
@@ -46,6 +55,8 @@ func (cfg *serveConfig) parse(out io.Writer, args []string) error {
 	// Flag parsing errors can quote argument values. Only print flag help.
 	flags.SetOutput(io.Discard)
 	flags.StringVar(&cfg.listen, "listen", "127.0.0.1:8080", "HTTP listen address")
+	flags.StringVar(&cfg.readListen, readListenFlag, "", "private read API listen address")
+	flags.StringVar(&cfg.tokenFile, readTokenFileFlag, "", "read API bearer token hash file")
 	flags.StringVar(&cfg.storeDir, "store-dir", "/data/nats", "JetStream data directory")
 	flags.Func("github-secret", "GitHub webhook secret (overrides file and environment)", func(value string) error {
 		cfg.secret = &value
@@ -82,6 +93,10 @@ func (cfg *serveConfig) parse(out io.Writer, args []string) error {
 	})
 
 	err := flags.Parse(args)
+	provided := make(map[string]bool)
+
+	flags.Visit(func(option *flag.Flag) { provided[option.Name] = true })
+
 	switch {
 	case errors.Is(err, flag.ErrHelp):
 		flags.SetOutput(out)
@@ -96,6 +111,8 @@ func (cfg *serveConfig) parse(out io.Writer, args []string) error {
 		return errBodyCap
 	case cfg.maxMemory < 0, cfg.maxStore < 0:
 		return errStoreLimit
+	case provided[readListenFlag] != provided[readTokenFileFlag], provided[readListenFlag] && cfg.readListen == "":
+		return errReadFlags
 	default:
 		return nil
 	}
@@ -129,6 +146,16 @@ func serve(ctx context.Context, out io.Writer, logHandler slog.Handler, args []s
 		return err
 	}
 
+	var tokens readTokens
+	if cfg.readListen != "" {
+		tokens.path = cfg.tokenFile
+
+		err = tokens.load()
+		if err != nil {
+			return err
+		}
+	}
+
 	secret, err := cfg.loadSecret()
 	if err != nil {
 		return err
@@ -160,20 +187,61 @@ func serve(ctx context.Context, out io.Writer, logHandler slog.Handler, args []s
 	handler.store = store
 	handler.telemetry = signals
 
+	webhook := gatewayHTTP(cfg.listen, handler)
+	if cfg.readListen == "" {
+		return runHTTPServer(ctx, webhook)
+	}
+
+	api := readAPI{tokens: &tokens, store: store, telemetry: signals}
+	reader := gatewayHTTP(cfg.readListen, api.handler())
+
+	return runHTTP(ctx, &tokens, signals.logger, webhook, reader)
+}
+
+func gatewayHTTP(address string, handler http.Handler) *http.Server {
 	//nolint:exhaustruct_v5 // The gateway sets the address, handler, and timeouts it needs.
-	httpServer := &http.Server{
-		Addr:                         cfg.listen,
+	return &http.Server{
+		Addr:                         address,
 		Handler:                      handler,
 		DisableGeneralOptionsHandler: true,
 		ReadHeaderTimeout:            readTimeout,
 		ReadTimeout:                  readTimeout,
 		WriteTimeout:                 writeTimeout,
 	}
-
-	return runHTTP(ctx, httpServer)
 }
 
-func runHTTP(ctx context.Context, httpServer *http.Server) error {
+func runHTTP(ctx context.Context, tokens *readTokens, logger *slog.Logger, servers ...*http.Server) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	stopped := make(chan error, len(servers))
+	for _, server := range servers {
+		go func() {
+			stopped <- runHTTPServer(ctx, server)
+
+			cancel()
+		}()
+	}
+
+	var err error
+
+	for remaining := len(servers); remaining > 0; {
+		select {
+		case result := <-stopped:
+			err = errors.Join(err, result)
+			remaining--
+		case <-ticker.C:
+			tokens.reload(ctx, logger)
+		}
+	}
+
+	return err
+}
+
+func runHTTPServer(ctx context.Context, httpServer *http.Server) error {
 	done := make(chan error, 1)
 	stop := context.AfterFunc(ctx, func() {
 		shutdown, cancel := context.WithTimeout(context.WithoutCancel(ctx), shutdownTimeout)
