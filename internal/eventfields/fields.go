@@ -63,8 +63,18 @@ func FromEnvelope(seq uint64, envelope []byte) (Fields, error) {
 	fields.setString("head_sha", &fields.HeadSHA, headSHA(fields.Event, payload))
 
 	filtered := filter.Extract(fields.Event, rawPayload)
-	if filtered.Number != nil {
-		fields.Number = *filtered.Number
+	number := filtered.Number
+
+	if number == nil && fields.Event == "pull_request_review_comment" {
+		var value *int64
+
+		if json.Unmarshal(readObject(payload["pull_request"])["number"], &value) == nil {
+			number = value
+		}
+	}
+
+	if number != nil {
+		fields.Number = *number
 		fields.present["number"] = true
 	}
 
