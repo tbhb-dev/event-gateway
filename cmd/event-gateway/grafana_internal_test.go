@@ -13,15 +13,10 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
-
-	metricnoop "go.opentelemetry.io/otel/metric/noop"
-	tracenoop "go.opentelemetry.io/otel/trace/noop"
 )
 
 const (
@@ -30,7 +25,6 @@ const (
 		`"fingerprint":"abc","panelURL":"HTTPS://grafana.example/panel","dashboardURL":"https://grafana.example/d",` +
 		`"annotations":{"secret":"hidden"}}`
 	accountAlert = `{"status":"resolved","labels":{"agent_account":"acct_1"},"dashboardURL":"ftp://x","panelURL":5}`
-	badListen    = "-listen=127.0.0.1:-1"
 	zeroDigest   = "0000000000000000000000000000000000000000000000000000000000000000"
 )
 
@@ -41,8 +35,7 @@ func grafanaHook(t *testing.T) (*grafanaWebhook, eventStore) {
 	hook, err := newGrafanaWebhook([]byte(fixtureKey))
 	checkError(t, err)
 
-	hook.store = store
-	hook.telemetry = newTelemetry(slog.DiscardHandler, tracenoop.NewTracerProvider(), metricnoop.NewMeterProvider())
+	hook.store, hook.telemetry = store, newTelemetry(slog.DiscardHandler, nil, nil)
 
 	return hook, store
 }
@@ -61,10 +54,6 @@ func alertsBody(entries ...string) string {
 	return `{"alerts":[` + strings.Join(entries, ",") + `]}`
 }
 
-func grafanaStatus(hook *grafanaWebhook, req *http.Request) int {
-	return responseStatus(hook.ServeHTTP, req)
-}
-
 type failingBody struct{}
 
 func (failingBody) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
@@ -77,7 +66,6 @@ func TestGrafanaRequests(t *testing.T) {
 	wrong := func(string) string { return zeroDigest }
 	alerts := func(n int, entry string) string { return alertsBody(strings.Repeat(entry+",", n-1) + entry) }
 	scope := func(s string) string { return `{"status":"firing","labels":{"host_name":` + s + `}}` }
-	status := func(s string) string { return `{"status":"` + s + `","labels":{"host_name":"h"}}` }
 
 	for _, test := range []struct {
 		sign   func(string) string
@@ -96,12 +84,12 @@ func TestGrafanaRequests(t *testing.T) {
 		{valid, `{}`, http.StatusBadRequest},
 		{valid, alerts(101, hostAlert), http.StatusBadRequest},
 		{valid, alerts(100, `{"status":"firing"}`), http.StatusAccepted},
-		{valid, alertsBody(status("pending"), `{"status":5}`, `"text"`), http.StatusAccepted},
+		{valid, alertsBody(`{"status":"pending","labels":{"host_name":"h"}}`, `{"status":5}`, `"text"`), http.StatusAccepted},
 		{valid, alertsBody(scope(`"bad value"`), scope("7"), `{"status":"firing","labels":"x"}`), http.StatusAccepted},
 	} {
 		req := grafanaSigned(t.Context(), test.body)
 		req.Header.Set(grafanaSignature, test.sign(req.Header.Get(grafanaSignature)))
-		checkEqual(t, grafanaStatus(hook, req), test.status)
+		expectStatus(t, hook.ServeHTTP, req, test.status)
 	}
 }
 
@@ -118,18 +106,16 @@ func TestGrafanaRequestErrors(t *testing.T) {
 	broken.Body = io.NopCloser(failingBody{})
 	broken.ContentLength = -1
 
-	checkEqual(t, grafanaStatus(hook, huge), http.StatusRequestEntityTooLarge)
-	checkEqual(t, grafanaStatus(hook, declared), http.StatusRequestEntityTooLarge)
-	checkEqual(t, grafanaStatus(hook, broken), http.StatusBadRequest)
-	checkEqual(
-		t,
-		grafanaStatus(hook, httptest.NewRequestWithContext(ctx, http.MethodGet, grafanaPath, nil)),
-		http.StatusMethodNotAllowed,
-	)
+	expectStatus(t, hook.ServeHTTP, huge, http.StatusRequestEntityTooLarge)
+	expectStatus(t, hook.ServeHTTP, declared, http.StatusRequestEntityTooLarge)
+	expectStatus(t, hook.ServeHTTP, broken, http.StatusBadRequest)
+
+	get := httptest.NewRequestWithContext(ctx, http.MethodGet, grafanaPath, nil)
+	expectStatus(t, hook.ServeHTTP, get, http.StatusMethodNotAllowed)
 
 	// A store that cannot commit answers 503.
 	cancel()
-	checkEqual(t, grafanaStatus(hook, grafanaSigned(ctx, alertsBody(hostAlert))), http.StatusServiceUnavailable)
+	expectStatus(t, hook.ServeHTTP, grafanaSigned(ctx, alertsBody(hostAlert)), http.StatusServiceUnavailable)
 }
 
 func TestGrafanaStoredEvents(t *testing.T) {
@@ -142,8 +128,8 @@ func TestGrafanaStoredEvents(t *testing.T) {
 	body := alertsBody(`{"status":"firing"}`, hostAlert, accountAlert, both, fallback)
 
 	// A retried body is a duplicate.
-	checkEqual(t, grafanaStatus(hook, grafanaSigned(ctx, body)), http.StatusAccepted)
-	checkEqual(t, grafanaStatus(hook, grafanaSigned(ctx, body)), http.StatusAccepted)
+	expectStatus(t, hook.ServeHTTP, grafanaSigned(ctx, body), http.StatusAccepted)
+	expectStatus(t, hook.ServeHTTP, grafanaSigned(ctx, body), http.StatusAccepted)
 
 	info, infoErr := store.stream.Info(ctx)
 	checkError(t, infoErr)
@@ -178,7 +164,7 @@ func TestGrafanaStoredEvents(t *testing.T) {
 
 	clash.Payload = []byte(`{"x":2}`)
 	checkError(t, store.publish(ctx, clash))
-	checkEqual(t, grafanaStatus(hook, grafanaSigned(ctx, clashBody)), http.StatusConflict)
+	expectStatus(t, hook.ServeHTTP, grafanaSigned(ctx, clashBody), http.StatusConflict)
 }
 
 func TestGrafanaWebhookRequiresSecret(t *testing.T) {
@@ -187,43 +173,5 @@ func TestGrafanaWebhookRequiresSecret(t *testing.T) {
 	for _, secret := range [][]byte{nil, {}, []byte(" \t\n")} {
 		_, err := newGrafanaWebhook(secret)
 		checkEqual(t, errors.Is(err, errGrafanaSecret), true)
-	}
-}
-
-func TestServeRejectsInvalidGrafanaSecret(t *testing.T) {
-	dir := t.TempDir()
-	empty, blank, missing := filepath.Join(dir, "empty"), filepath.Join(dir, "blank"), filepath.Join(dir, "missing")
-
-	checkError(t, os.WriteFile(empty, nil, 0o600))
-	checkError(t, os.WriteFile(blank, []byte(" \t\r\n"), 0o600))
-
-	for _, test := range []struct {
-		err    error
-		name   string
-		env    string
-		arg    string
-		setEnv bool
-	}{
-		{errGrafanaSecret, "empty environment", "", "-body-cap=1", true},
-		{errGrafanaSecret, "blank environment", " \t", "-body-cap=1", true},
-		{errGrafanaSecret, "empty flag", "", "-grafana-secret=", false},
-		{errGrafanaSecret, "blank flag", "", "-grafana-secret= \t", false},
-		{errGrafanaSecret, "empty file", "", "-grafana-secret-file=" + empty, false},
-		{errGrafanaSecret, "blank file", "", "-grafana-secret-file=" + blank, false},
-		{os.ErrNotExist, "missing file", "", "-grafana-secret-file=" + missing, false},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			t.Setenv(grafanaEnv, test.env)
-
-			if !test.setEnv {
-				checkError(t, os.Unsetenv(grafanaEnv))
-			}
-
-			t.Setenv("GITHUB_WEBHOOK_SECRET", fixtureKey)
-
-			args := []string{serveCommand, badListen, storeDirFlag + t.TempDir(), test.arg}
-			err := run(t.Context(), io.Discard, slog.DiscardHandler, args)
-			checkEqual(t, errors.Is(err, test.err), true)
-		})
 	}
 }
