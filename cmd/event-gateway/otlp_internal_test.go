@@ -11,7 +11,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -98,12 +97,10 @@ func TestOTLPEndpointValidation(t *testing.T) {
 	for _, endpoint := range []string{
 		"https://:4318", "http://[invalid", "https://user@collector.example",
 		"ftp://collector.example", "http://192.0.2.1:4318", "http://collector.example",
+		"https://host:4318/v1?tenant=x", "https://host:4318/#frag", "https://host:4318/?",
 	} {
-		_, _, err := openTelemetry(
-			t.Context(),
-			slog.DiscardHandler,
-			otlpConfig{Endpoint: endpoint, Headers: nil, CAFile: ""},
-		)
+		cfg := otlpConfig{Endpoint: endpoint, Headers: nil, CAFile: ""}
+		_, _, err := openTelemetry(t.Context(), slog.DiscardHandler, cfg)
 		checkEqual(t, errors.Is(err, errOTLPEndpoint), true)
 	}
 
@@ -114,20 +111,29 @@ func TestOTLPEndpointValidation(t *testing.T) {
 func TestOTLPRedirects(t *testing.T) {
 	t.Parallel()
 
-	writer, err := newOTLPWriter(otlpConfig{Endpoint: collectorURL, Headers: nil, CAFile: ""})
-	checkError(t, err)
-
-	for endpoint, want := range map[string]error{
-		"http://collector.example":       http.ErrUseLastResponse,
-		"https://another.example":        http.ErrUseLastResponse,
-		"https://collector.example/path": nil,
+	for _, status := range []int{
+		http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther,
+		http.StatusTemporaryRedirect, http.StatusPermanentRedirect,
 	} {
-		destination, parseErr := url.Parse(endpoint)
-		checkError(t, parseErr)
+		collector := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+			if request.URL.Path == "/v1/traces" {
+				http.Redirect(response, request, "/target", status)
 
-		next := &http.Request{URL: destination} //nolint:exhaustruct_v5 // Redirect policy inspects only the URL.
-		checkEqual(t, writer.client.CheckRedirect(next, nil), want)
-		checkEqual(t, writer.client.CheckRedirect(next, make([]*http.Request, 10)), http.ErrUseLastResponse)
+				return
+			}
+
+			t.Errorf("redirect %d sent %s to %s", status, request.Method, request.URL.Path)
+		}))
+		t.Cleanup(collector.Close)
+
+		writer, err := newOTLPWriter(otlpConfig{Endpoint: collector.URL, Headers: nil, CAFile: ""})
+		checkError(t, err)
+		checkEqual(t, writer.UploadTraces(t.Context(), nil), errOTLPExport)
+
+		for _, target := range []string{"https" + strings.TrimPrefix(collector.URL, "http"), "http://other.example"} {
+			next := httptest.NewRequestWithContext(t.Context(), http.MethodGet, target, nil)
+			checkEqual(t, writer.client.CheckRedirect(next, nil), http.ErrUseLastResponse)
+		}
 	}
 }
 
