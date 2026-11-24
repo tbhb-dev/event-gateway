@@ -16,6 +16,6 @@ go_library(
 go_test(
     name = "filter_test",
     srcs = ["filter_test.go"],
-    embed = [":filter"],
     visibility = ["//:__pkg__"],
+    deps = [":filter"],
 )
