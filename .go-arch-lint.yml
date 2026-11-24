@@ -11,6 +11,7 @@ allow:
 
 components:
   cmd: {in: cmd/*}
+  filter: {in: internal/filter}
 
 vendors:
   nats:
@@ -29,3 +30,5 @@ deps:
   cmd:
     mayDependOn: [cmd]  # a leaf; go-arch-lint rejects an empty list
     canUse: [nats, telemetry]
+  filter:
+    mayDependOn: [filter]
