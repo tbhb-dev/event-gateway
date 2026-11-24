@@ -69,18 +69,34 @@ func (t *Template) Render(f Fields) (string, error) {
 		}
 	}
 
-	var result bytes.Buffer
+	var result cappedBuffer
 
 	err := t.template.Execute(&result, data)
-	if err != nil {
+	if err != nil && !errors.Is(err, errTooLong) {
 		return "", fmt.Errorf("%w: %w", ErrRender, err)
 	}
 
-	if result.Len() == 0 || result.Len() > maxResultBytes {
+	if err != nil || result.Len() == 0 {
 		return "", fmt.Errorf("%w: result must be 1 to %d bytes", ErrRender, maxResultBytes)
 	}
 
 	return result.String(), nil
+}
+
+var errTooLong = errors.New("result too long")
+
+// cappedBuffer fails a write that would grow it past maxResultBytes.
+type cappedBuffer struct{ bytes.Buffer }
+
+func (b *cappedBuffer) Write(data []byte) (int, error) {
+	if b.Len()+len(data) > maxResultBytes {
+		return 0, errTooLong
+	}
+
+	// bytes.Buffer.Write never fails.
+	_, _ = b.Buffer.Write(data)
+
+	return len(data), nil
 }
 
 func (f *Fields) values() map[string]any {

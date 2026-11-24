@@ -9,19 +9,21 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"go.tbhb.dev/event-gateway/internal/eventfields"
 )
 
 const (
-	pullRequest  = "pull_request"
-	issues       = "issues"
-	push         = "push"
-	labelField   = "label"
-	senderField  = "sender"
-	numberField  = "number"
-	headPattern  = `{{.head_sha}}`
-	eventPattern = `{{.event}}`
+	pullRequest   = "pull_request"
+	issues        = "issues"
+	reviewComment = "pull_request_review_comment"
+	push          = "push"
+	labelField    = "label"
+	senderField   = "sender"
+	numberField   = "number"
+	headPattern   = `{{.head_sha}}`
+	eventPattern  = `{{.event}}`
 )
 
 func TestFromEnvelope(t *testing.T) {
@@ -59,8 +61,22 @@ func TestFromEnvelope(t *testing.T) {
 			`{{.head_sha}}:{{.number}}`, "review:42", nil,
 		},
 		{
-			"review comment", "pull_request_review_comment", `{"pull_request":{"head":{"sha":"comment"}}}`,
+			"review comment", reviewComment, `{"pull_request":{"head":{"sha":"comment"}}}`,
 			headPattern, "comment", nil,
+		},
+		{
+			"review comment number", reviewComment, `{"pull_request":{"number":5}}`,
+			`{{.repository}}#{{.number}}`, "org/repo#5", nil,
+		},
+		{
+			"review comment no pull request", reviewComment, `{}`,
+			eventPattern, reviewComment,
+			[]string{numberField},
+		},
+		{
+			"review comment wrong number", reviewComment, `{"pull_request":{"number":"5"}}`,
+			eventPattern, reviewComment,
+			[]string{numberField},
 		},
 		{push, push, `{"after":"tip"}`, headPattern, "tip", nil},
 		{"check run", "check_run", `{"check_run":{"head_sha":"run"}}`, headPattern, "run", nil},
@@ -171,6 +187,36 @@ func TestTemplateRender(t *testing.T) {
 		got, err := compile(t, pattern).Render(fields)
 		if !errors.Is(err, eventfields.ErrRender) || got != "" {
 			t.Errorf("Render(%q) = %q, %v, want empty result and ErrRender", pattern, got, err)
+		}
+	}
+}
+
+func TestRenderBound(t *testing.T) {
+	t.Parallel()
+
+	start := time.Now()
+
+	for _, number := range []string{"2000", "9223372036854775807"} {
+		fields := extract(t, `{"provider":"github","event":"issues","delivery":"d","payload":{"issue":{"number":`+
+			number+`}}}`)
+
+		_, err := compile(t, `{{range .number}}x{{end}}`).Render(fields)
+		if !errors.Is(err, eventfields.ErrRender) {
+			t.Errorf("number %s: err = %v, want ErrRender", number, err)
+		}
+	}
+
+	if time.Since(start) > time.Second {
+		t.Error("render was not bounded")
+	}
+
+	for size, ok := range map[int]bool{1000: true, 1001: false} {
+		fields := extract(t, `{"provider":"github","event":"push","delivery":"d","payload":{"after":"`+
+			strings.Repeat("x", size)+`"}}`)
+
+		_, err := compile(t, headPattern).Render(fields)
+		if (err == nil) != ok {
+			t.Errorf("size %d: err = %v", size, err)
 		}
 	}
 }
