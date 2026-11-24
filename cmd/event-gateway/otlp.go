@@ -55,7 +55,7 @@ const (
 )
 
 var (
-	errOTLPEndpoint = errors.New("OTLP endpoint must be an HTTPS URL or a loopback HTTP URL")
+	errOTLPEndpoint = errors.New("OTLP endpoint requires HTTPS or loopback HTTP, with no query or fragment")
 	errCollectorCA  = errors.New("OTLP CA file must contain PEM certificates")
 	errOTLPExport   = errors.New("OTLP export failed")
 )
@@ -149,7 +149,8 @@ type otlpWriter struct {
 
 func newOTLPWriter(cfg otlpConfig) (*otlpWriter, error) {
 	endpoint, err := url.Parse(cfg.Endpoint)
-	if err != nil || endpoint.Hostname() == "" || endpoint.User != nil {
+	if err != nil || endpoint.Hostname() == "" || endpoint.User != nil ||
+		endpoint.RawQuery != "" || endpoint.ForceQuery || endpoint.Fragment != "" {
 		return nil, errOTLPEndpoint
 	}
 
@@ -182,16 +183,9 @@ func newOTLPWriter(cfg otlpConfig) (*otlpWriter, error) {
 
 	//nolint:exhaustruct_v5 // Collector requests use this transport and redirect policy.
 	client := &http.Client{
-		Transport: transport,
-		Timeout:   exportTimeout,
-		CheckRedirect: func(next *http.Request, via []*http.Request) error {
-			const maxRedirects = 10
-			if next.URL.Scheme != endpoint.Scheme || next.URL.Host != endpoint.Host || len(via) >= maxRedirects {
-				return http.ErrUseLastResponse
-			}
-
-			return nil
-		},
+		Transport:     transport,
+		Timeout:       exportTimeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
 
 	return &otlpWriter{endpoint: endpoint, headers: headers, client: client}, nil
