@@ -207,3 +207,7 @@ resourcepb
 sdklog
 traceexport
 tracepb
+buildx
+distroless
+nonroot
+trimpath
