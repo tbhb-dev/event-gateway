@@ -12,6 +12,7 @@ go_library(
         "github.go",
         "main.go",
         "otlp.go",
+        "serve.go",
         "store.go",
         "telemetry.go",
     ],

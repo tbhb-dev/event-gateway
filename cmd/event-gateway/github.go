@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -116,6 +117,17 @@ type githubWebhook struct {
 	telemetry telemetry
 	secret    []byte
 	bodyCap   int
+}
+
+var errSecret = errors.New("GitHub webhook secret is required and must contain a non-whitespace character")
+
+func newGitHubWebhook(secret []byte, bodyCap int) (*githubWebhook, error) {
+	if len(bytes.TrimSpace(secret)) == 0 {
+		return nil, errSecret
+	}
+
+	//nolint:exhaustruct_v5 // Serve opens and attaches the store and telemetry after validating the secret.
+	return &githubWebhook{secret: secret, bodyCap: bodyCap}, nil
 }
 
 func (h *githubWebhook) ServeHTTP(response http.ResponseWriter, request *http.Request) {

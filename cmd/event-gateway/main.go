@@ -1,24 +1,57 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Tony Burns
 
-// Command event-gateway prints its version. Step 1 of the design adds the
-// service.
+// Command event-gateway receives and stores GitHub webhooks.
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
+	"os/signal"
+	"syscall"
 )
 
-// version is the build's version. Release builds don't stamp it yet.
-const version = "dev"
+const (
+	version      = "dev"
+	serveCommand = "serve"
+)
 
 func main() {
-	run(os.Stdout)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
+	err := run(ctx, os.Stdout, logger.Handler(), os.Args[1:])
+
+	stop()
+
+	os.Exit(exitCode(ctx, logger, err))
 }
 
-// run writes the version line to out.
-func run(out io.Writer) {
-	fmt.Fprintf(out, "event-gateway %s\n", version)
+func exitCode(ctx context.Context, logger *slog.Logger, err error) int {
+	if err != nil {
+		logger.ErrorContext(ctx, "event gateway stopped", "error", err)
+
+		return 1
+	}
+
+	return 0
+}
+
+func run(ctx context.Context, out io.Writer, logHandler slog.Handler, args []string) error {
+	if len(args) == 0 {
+		_, err := fmt.Fprintf(out, "event-gateway %s\n", version)
+		if err != nil {
+			return fmt.Errorf("write version: %w", err)
+		}
+
+		return nil
+	}
+
+	if args[0] != serveCommand {
+		return errUsage
+	}
+
+	return serve(ctx, out, logHandler, args[1:])
 }
