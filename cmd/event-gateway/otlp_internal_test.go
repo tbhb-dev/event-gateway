@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"encoding/pem"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -21,6 +22,10 @@ import (
 	"github.com/go-logr/logr/funcr"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	"google.golang.org/protobuf/proto"
+
+	metricexport "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
+	traceexport "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 )
 
 const (
@@ -177,3 +182,78 @@ func TestOTLPFailureKeepsWebhookAccepted(t *testing.T) {
 }
 
 var errFixtureExport = errors.New("collector reported " + collectorToken)
+
+//nolint:paralleltest // Environment variables are process-wide.
+func TestOTLPIgnoresOTELVariables(t *testing.T) {
+	for key, value := range map[string]string{
+		"OTEL_SDK_DISABLED":               "true",
+		"OTEL_TRACES_SAMPLER":             "always_off",
+		"OTEL_RESOURCE_ATTRIBUTES":        "env.leak=yes,service.name=env-service",
+		"OTEL_SERVICE_NAME":               "env-service",
+		"OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT": "0",
+		"OTEL_BSP_MAX_QUEUE_SIZE":         "1",
+		"OTEL_BLRP_MAX_QUEUE_SIZE":        "1",
+		"OTEL_METRIC_EXPORT_INTERVAL":     "1",
+		"OTEL_METRICS_EXEMPLAR_FILTER":    "always_off",
+	} {
+		t.Setenv(key, value)
+	}
+
+	var (
+		lock    sync.Mutex
+		traces  traceexport.ExportTraceServiceRequest
+		metrics metricexport.ExportMetricsServiceRequest
+	)
+
+	collector := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		body, err := io.ReadAll(request.Body)
+		checkError(t, err)
+
+		lock.Lock()
+		defer lock.Unlock()
+
+		switch request.URL.Path {
+		case "/v1/traces":
+			checkError(t, proto.Unmarshal(body, &traces))
+		case "/v1/metrics":
+			checkError(t, proto.Unmarshal(body, &metrics))
+		}
+
+		response.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(collector.Close)
+
+	signals, closeSignals, err := openTelemetry(t.Context(), slog.DiscardHandler, otlpConfig{
+		Endpoint: collector.URL, Headers: nil, CAFile: "",
+	})
+	checkError(t, err)
+
+	hook := &githubWebhook{
+		store: testStore(t, retention), telemetry: signals, secret: []byte(fixtureKey), bodyCap: defaultBodyCap,
+	}
+	expectStatus(t, hook.ServeHTTP, signedRequest(t.Context(), issuesEvent, "1", "{}"), http.StatusAccepted)
+	closeSignals()
+
+	lock.Lock()
+	defer lock.Unlock()
+
+	// The sampler keeps the span and the attribute limit keeps its attributes.
+	checkEqual(t, len(traces.GetResourceSpans()), 1)
+	spans := traces.GetResourceSpans()[0]
+	checkEqual(t, len(spans.GetScopeSpans()[0].GetSpans()), 1)
+	checkEqual(t, len(spans.GetScopeSpans()[0].GetSpans()[0].GetAttributes()), 2)
+
+	// The resource holds only the explicit service name.
+	checkEqual(t, len(spans.GetResource().GetAttributes()), 1)
+	checkEqual(t, spans.GetResource().GetAttributes()[0].GetKey(), "service.name")
+	checkEqual(t, spans.GetResource().GetAttributes()[0].GetValue().GetStringValue(), serviceName)
+
+	checkEqual(t, len(metrics.GetResourceMetrics()), 1)
+	resource := metrics.GetResourceMetrics()[0].GetResource()
+	checkEqual(t, len(resource.GetAttributes()), 1)
+	checkEqual(t, resource.GetAttributes()[0].GetValue().GetStringValue(), serviceName)
+
+	metric := metrics.GetResourceMetrics()[0].GetScopeMetrics()[0].GetMetrics()[0]
+	checkEqual(t, metric.GetName(), "event_gateway_ingest_total")
+	checkEqual(t, metric.GetSum().GetDataPoints()[0].GetAsInt(), int64(1))
+}

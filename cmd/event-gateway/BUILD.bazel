@@ -32,6 +32,7 @@ go_library(
         "@io_opentelemetry_go_otel_sdk//trace",
         "@io_opentelemetry_go_otel_sdk_log//:log",
         "@io_opentelemetry_go_otel_sdk_metric//:metric",
+        "@io_opentelemetry_go_otel_sdk_metric//exemplar",
         "@io_opentelemetry_go_otel_sdk_metric//metricdata",
         "@io_opentelemetry_go_otel_trace//:trace",
         "@io_opentelemetry_go_otel_trace//noop",
@@ -76,5 +77,8 @@ go_test(
         "@io_opentelemetry_go_otel_sdk_metric//:metric",
         "@io_opentelemetry_go_otel_sdk_metric//metricdata",
         "@io_opentelemetry_go_otel_trace//noop",
+        "@io_opentelemetry_go_proto_otlp//collector/metrics/v1:metrics",
+        "@io_opentelemetry_go_proto_otlp//collector/trace/v1:trace",
+        "@org_golang_google_protobuf//proto",
     ],
 )

@@ -10,6 +10,7 @@ bazelisk
 bazelrc
 bazelversion
 BINDIR
+blrp
 bodyclose
 buildcop
 buildifier

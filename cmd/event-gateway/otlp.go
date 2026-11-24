@@ -22,6 +22,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
+	"go.opentelemetry.io/otel/sdk/metric/exemplar"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"go.opentelemetry.io/otel/sdk/resource"
 	"google.golang.org/protobuf/proto"
@@ -39,7 +40,19 @@ import (
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 )
 
-const exportTimeout = 5 * time.Second
+const (
+	exportTimeout = 5 * time.Second
+
+	// The SDK defaults, pinned so that no OTEL_* variable can change them.
+	batchDelay       = 5 * time.Second
+	batchQueueSize   = 2048
+	batchSize        = 512
+	logBatchInterval = time.Second
+	logBatchTimeout  = 30 * time.Second
+	attributeLimit   = 128
+	valueDepthLimit  = 64
+	cardinalityLimit = 2000
+)
 
 var (
 	errOTLPEndpoint = errors.New("OTLP endpoint must be an HTTPS URL or a loopback HTTP URL")
@@ -70,21 +83,45 @@ func openTelemetry(ctx context.Context, handler slog.Handler, cfg otlpConfig) (t
 
 	//nolint:errcheck // The HTTP client has no connection to start.
 	traceExporter, _ := otlptrace.New(ctx, writer)
+	// The SDK's WithResource options always merge OTEL_RESOURCE_ATTRIBUTES and OTEL_SERVICE_NAME
+	// into the provider resource, and v1.47.0 has no option to skip that. The wire resource is
+	// therefore rebuilt in UploadTraces, and the metric and log exporters already build their own.
 	res := resource.NewSchemaless(attribute.String("service.name", serviceName))
 	tracer := sdktrace.NewTracerProvider(
 		sdktrace.WithResource(res),
 		sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.AlwaysSample())),
-		sdktrace.WithBatcher(traceExporter, sdktrace.WithExportTimeout(exportTimeout)),
+		sdktrace.WithRawSpanLimits(sdktrace.SpanLimits{
+			AttributeValueLengthLimit:   -1,
+			AttributeValueDepthLimit:    valueDepthLimit,
+			AttributeCountLimit:         attributeLimit,
+			EventCountLimit:             attributeLimit,
+			LinkCountLimit:              attributeLimit,
+			AttributePerEventCountLimit: attributeLimit,
+			AttributePerLinkCountLimit:  attributeLimit,
+		}),
+		sdktrace.WithBatcher(traceExporter,
+			sdktrace.WithBatchTimeout(batchDelay),
+			sdktrace.WithMaxQueueSize(batchQueueSize),
+			sdktrace.WithMaxExportBatchSize(batchSize),
+			sdktrace.WithExportTimeout(exportTimeout),
+		),
 	)
 	meter := sdkmetric.NewMeterProvider(
 		sdkmetric.WithResource(res),
+		sdkmetric.WithExemplarFilter(exemplar.TraceBasedFilter),
+		sdkmetric.WithCardinalityLimit(cardinalityLimit),
 		sdkmetric.WithReader(sdkmetric.NewPeriodicReader(
 			otlpMetrics{writer}, sdkmetric.WithInterval(time.Minute), sdkmetric.WithTimeout(exportTimeout),
 		)),
 	)
 	logger := sdklog.NewLoggerProvider(
 		sdklog.WithResource(res),
-		sdklog.WithProcessor(sdklog.NewBatchProcessor(otlpLogs{writer})),
+		sdklog.WithProcessor(sdklog.NewBatchProcessor(otlpLogs{writer},
+			sdklog.WithMaxQueueSize(batchQueueSize),
+			sdklog.WithExportInterval(logBatchInterval),
+			sdklog.WithExportTimeout(logBatchTimeout),
+			sdklog.WithExportMaxBatchSize(batchSize),
+		)),
 	)
 	local := slog.New(handler)
 	both := slog.NewMultiHandler(handler, otelslog.NewHandler(serviceName, otelslog.WithLoggerProvider(logger)))
@@ -170,6 +207,10 @@ func (*otlpWriter) ForceFlush(context.Context) error { return nil }
 func (*otlpWriter) Shutdown(context.Context) error   { return nil }
 
 func (w *otlpWriter) UploadTraces(ctx context.Context, spans []*tracepb.ResourceSpans) error {
+	for _, group := range spans {
+		group.Resource, group.SchemaUrl = otlpResource(), ""
+	}
+
 	return w.send(ctx, "traces", &traceexport.ExportTraceServiceRequest{ResourceSpans: spans})
 }
 
