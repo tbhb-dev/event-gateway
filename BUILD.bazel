@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright Tony Burns
+# cspell:words eventfields
 
 load("@bazel_env.bzl", "bazel_env")
 load("@bazelrc-preset.bzl", "bazelrc_preset")
@@ -83,6 +84,7 @@ nogo(
 GO_TARGETS = [
     "//cmd/event-gateway",
     "//cmd/event-gateway:event-gateway_test",
+    "//internal/eventfields:eventfields_test",
     "//internal/filter:filter_test",
 ]
 
@@ -125,6 +127,14 @@ gobco_test(
     go_sum = "go.sum",
     proxy = "@go_mod_proxy//:proxy",
     tests = ["//cmd/event-gateway:event-gateway_test"],
+)
+
+gobco_test(
+    name = "eventfields_gobco_test",
+    go_mod = "go.mod",
+    go_sum = "go.sum",
+    proxy = "@go_mod_proxy//:proxy",
+    tests = ["//internal/eventfields:eventfields_test"],
 )
 
 gobco_test(
