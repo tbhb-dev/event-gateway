@@ -52,6 +52,8 @@ func TestReadTokenReload(t *testing.T) {
 
 	signals := newTelemetry(slog.NewJSONHandler(&logs, nil), nil, nil)
 	tokens.path = filepath.Join(t.TempDir(), "tokens")
+	checkError(t, os.WriteFile(tokens.path, nil, 0o600))
+	checkEqual(t, tokens.load(), errTokenFormat)
 	writeReadTokens(t, tokens.path, "first", readFixture)
 	checkError(t, tokens.load())
 
@@ -89,7 +91,7 @@ func TestReadEventRoutes(t *testing.T) {
 	hook := testWebhook(t, store, defaultBodyCap)
 
 	for index := range pageLimit + 2 {
-		event := pushEvent
+		event := "push"
 		if index == pageLimit+1 {
 			event = "issues"
 		}
@@ -135,12 +137,10 @@ func TestReadEventRoutes(t *testing.T) {
 	response = readRequest(t, api, eventsPath+"/2", header, http.StatusOK)
 	checkEqual(t, strings.Contains(response.Body.String(), `"payload":{"message":"stored"}`), true)
 
-	exerciseSession(t, api, hook)
-
 	//nolint:exhaustruct_v5 // The test consumer only needs a bounded reset.
 	consumer, err := store.stream.OrderedConsumer(t.Context(), jetstream.OrderedConsumerConfig{MaxResetAttempts: 1})
 	checkError(t, err)
-	store.jet.Conn().Close()
+	exerciseSession(t, api, hook, consumer)
 	readRequest(t, api, eventsPath, header, http.StatusServiceUnavailable)
 	readRequest(t, api, eventsPath+"/1", header, http.StatusServiceUnavailable)
 	api.store.stream = expiredStream{Stream: store.stream}

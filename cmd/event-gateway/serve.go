@@ -220,29 +220,17 @@ func serve(ctx context.Context, out io.Writer, logHandler slog.Handler, args []s
 	api := readAPI{tokens: &tokens, store: store, telemetry: signals}
 
 	reader := gatewayHTTP(cfg.readListen, api.handler())
-	if cfg.wsListen == "" {
-		return runHTTP(ctx, &tokens, signals.logger, webhook, reader)
+	if cfg.wsListen != "" {
+		sessions := newSessionAPI(api, helloTimeout)
+		server := gatewayHTTP(cfg.wsListen, http.HandlerFunc(sessions.connect))
+		server.RegisterOnShutdown(func() { close(sessions.stop) })
+
+		defer sessions.active.Wait()
+
+		return runHTTP(ctx, &tokens, signals.logger, webhook, reader, server)
 	}
 
-	return runSessionHTTP(ctx, cfg.wsListen, api, webhook, reader)
-}
-
-func runSessionHTTP(ctx context.Context, address string, api readAPI, servers ...*http.Server) error {
-	stop := make(chan struct{})
-	//nolint:exhaustruct_v5 // The connection wait group starts empty.
-	sessions := sessionAPI{
-		stop:      stop,
-		stream:    api.store.stream,
-		tokens:    api.tokens,
-		telemetry: api.telemetry,
-		helloWait: helloTimeout,
-	}
-	server := gatewayHTTP(address, http.HandlerFunc(sessions.connect))
-	server.RegisterOnShutdown(func() { close(stop) })
-
-	defer sessions.active.Wait()
-
-	return runHTTP(ctx, api.tokens, api.telemetry.logger, append(servers, server)...)
+	return runHTTP(ctx, &tokens, signals.logger, webhook, reader)
 }
 
 func gatewayHTTP(address string, handler http.Handler) *http.Server {
