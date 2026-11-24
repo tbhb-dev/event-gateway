@@ -85,6 +85,7 @@ nogo(
 GO_TARGETS = [
     "//cmd/event-gateway",
     "//cmd/event-gateway:event-gateway_test",
+    "//deploy:deploy_test",
     "//internal/eventfields:eventfields_test",
     "//internal/filter:filter_test",
     "//internal/routing:routing_test",
