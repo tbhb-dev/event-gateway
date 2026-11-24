@@ -1,0 +1,26 @@
+{
+  "handshakes": [
+    {"path":"/other","method":"GET","header":{"Authorization":["Bearer first-fixture"]},"status":404},
+    {"path":"/connect","method":"HEAD","header":{"Authorization":["Bearer first-fixture"]},"status":405},
+    {"path":"/connect","method":"GET","header":{},"status":401},
+    {"path":"/connect","method":"GET","header":{"Authorization":["Bearer wrong"],"Connection":["Upgrade"],"Upgrade":["websocket"]},"status":401},
+    {"path":"/connect","method":"GET","header":{"Authorization":["Bearer first-fixture"]},"status":426},
+    {"path":"/connect","method":"GET","header":{"Authorization":["Bearer first-fixture"],"Connection":["Upgrade"]},"status":426},
+    {"path":"/connect","method":"GET","header":{"Authorization":["Bearer first-fixture"],"Connection":["Upgrade"],"Upgrade":["websocket"]},"status":400},
+    {"path":"/connect","method":"GET","header":{"Authorization":["Bearer first-fixture"],"Connection":["Upgrade"],"Upgrade":["websocket"],"Sec-Websocket-Protocol":["gateway.v1"]},"status":400}
+  ],
+  "commands": [
+    {"send":[],"key":"code","want":"bad_message"},
+    {"send":{"type":"other","id":"This request identifier has more than sixty four characters in total."},"key":"code","want":"bad_message"},
+    {"send":{"type":"ping"},"key":"type","want":"pong"},
+    {"send":{"type":"hello","subscriptions":[{"provider":"github"}]},"key":"code","want":"bad_subscription"},
+    {"send":{"type":"hello","resume_after":0,"import":{}},"key":"code","want":"bad_message"},
+    {"send":{"type":"hello","resume_after":-1},"key":"code","want":"bad_message"},
+    {"send":{"type":"hello","more":3},"key":"code","want":"bad_message"},
+    {"send":{"type":"hello","subscriptions":{}},"key":"code","want":"bad_message"},
+    {"send":{"type":"hello","more":true,"subscriptions":[{"provider":"github","event":"push","repository":"example/repo"}]}},
+    {"send":{"type":"hello","resume_after":0},"key":"code","want":"bad_message"},
+    {"send":{"type":"hello","id":"ready","more":false},"key":"id","want":"ready"},
+    {"send":{"type":"hello"},"key":"code","want":"bad_message"}
+  ]
+}

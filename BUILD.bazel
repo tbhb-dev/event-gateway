@@ -121,6 +121,7 @@ govulncheck(
 # package per run. The requirement is fixed at 100%.
 gobco_test(
     name = "event-gateway_gobco_test",
+    data = ["//cmd/event-gateway:testdata/session.json"],
     go_mod = "go.mod",
     go_sum = "go.sum",
     proxy = "@go_mod_proxy//:proxy",

@@ -14,6 +14,8 @@ components:
   filter: {in: internal/filter}
 
 vendors:
+  websocket:
+    in: [github.com/coder/websocket, github.com/coder/websocket/**]
   nats:
     in: [github.com/nats-io/nats-server/v2/**, github.com/nats-io/nats.go, github.com/nats-io/nats.go/**]
   telemetry:
@@ -28,7 +30,7 @@ vendors:
 
 deps:
   cmd:
-    mayDependOn: [cmd]  # a leaf; go-arch-lint rejects an empty list
-    canUse: [nats, telemetry]
+    mayDependOn: [cmd, filter]
+    canUse: [nats, telemetry, websocket]
   filter:
     mayDependOn: [filter]

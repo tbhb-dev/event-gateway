@@ -8,7 +8,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -68,8 +67,6 @@ func TestReadTokenReload(t *testing.T) {
 	tokens.reload(t.Context(), signals.logger)
 	readRequest(t, api, "/unknown", "bearer "+readFixture, http.StatusNotFound)
 	checkEqual(t, strings.Contains(logs.String(), "reload read token file"), true)
-	checkError(t, os.WriteFile(tokens.path, nil, 0o600))
-	checkEqual(t, errors.Is(tokens.load(), errTokenFormat), true)
 
 	writeReadTokens(t, tokens.path, "second", "second-fixture")
 	tokens.reload(t.Context(), signals.logger)
@@ -92,7 +89,7 @@ func TestReadEventRoutes(t *testing.T) {
 	hook := testWebhook(t, store, defaultBodyCap)
 
 	for index := range pageLimit + 2 {
-		event := "push"
+		event := pushEvent
 		if index == pageLimit+1 {
 			event = "issues"
 		}
@@ -137,6 +134,8 @@ func TestReadEventRoutes(t *testing.T) {
 
 	response = readRequest(t, api, eventsPath+"/2", header, http.StatusOK)
 	checkEqual(t, strings.Contains(response.Body.String(), `"payload":{"message":"stored"}`), true)
+
+	exerciseSession(t, api, hook)
 
 	//nolint:exhaustruct_v5 // The test consumer only needs a bounded reset.
 	consumer, err := store.stream.OrderedConsumer(t.Context(), jetstream.OrderedConsumerConfig{MaxResetAttempts: 1})

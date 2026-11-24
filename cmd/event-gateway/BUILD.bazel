@@ -6,6 +6,11 @@ load("@tbhb_rules//repo:defs.bzl", "repo_files")
 
 repo_files()
 
+exports_files(
+    ["testdata/session.json"],
+    visibility = ["//:__pkg__"],
+)
+
 go_library(
     name = "event-gateway_lib",
     srcs = [
@@ -16,12 +21,15 @@ go_library(
         "read.go",
         "read_tokens.go",
         "serve.go",
+        "session.go",
         "store.go",
         "telemetry.go",
     ],
     importpath = "go.tbhb.dev/event-gateway/cmd/event-gateway",
     visibility = ["//visibility:private"],
     deps = [
+        "//internal/filter",
+        "@com_github_coder_websocket//:websocket",
         "@com_github_go_logr_logr//:logr",
         "@com_github_nats_io_nats_go//:nats_go",
         "@com_github_nats_io_nats_go//jetstream",
@@ -66,12 +74,15 @@ go_test(
         "main_internal_test.go",
         "otlp_internal_test.go",
         "read_internal_test.go",
+        "session_internal_test.go",
         "store_internal_test.go",
     ],
+    data = glob(["testdata/**"]),
     embed = [":event-gateway_lib"],
     # The whole-module Go checks in the root package take the tests too.
     visibility = ["//:__pkg__"],
     deps = [
+        "@com_github_coder_websocket//:websocket",
         "@com_github_go_logr_logr//funcr",
         "@com_github_nats_io_nats_go//:nats_go",
         "@com_github_nats_io_nats_go//jetstream",
