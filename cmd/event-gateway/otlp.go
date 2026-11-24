@@ -111,7 +111,8 @@ func openTelemetry(ctx context.Context, handler slog.Handler, cfg otlpConfig) (t
 		sdkmetric.WithExemplarFilter(exemplar.TraceBasedFilter),
 		sdkmetric.WithCardinalityLimit(cardinalityLimit),
 		sdkmetric.WithReader(sdkmetric.NewPeriodicReader(
-			otlpMetrics{writer}, sdkmetric.WithInterval(time.Minute), sdkmetric.WithTimeout(exportTimeout),
+			otlpMetrics{otlpWriter: writer, start: time.Now()},
+			sdkmetric.WithInterval(time.Minute), sdkmetric.WithTimeout(exportTimeout),
 		)),
 	)
 	logger := sdklog.NewLoggerProvider(
@@ -236,7 +237,11 @@ func (w *otlpWriter) send(ctx context.Context, signal string, message proto.Mess
 	return nil
 }
 
-type otlpMetrics struct{ *otlpWriter }
+type otlpMetrics struct {
+	*otlpWriter
+
+	start time.Time
+}
 
 func (otlpMetrics) Temporality(kind sdkmetric.InstrumentKind) metricdata.Temporality {
 	return sdkmetric.DefaultTemporalitySelector(kind)
@@ -263,10 +268,13 @@ func (w otlpMetrics) Export(ctx context.Context, data *metricdata.ResourceMetric
 				IsMonotonic:            sum.IsMonotonic,
 				AggregationTemporality: metricpb.AggregationTemporality_AGGREGATION_TEMPORALITY_CUMULATIVE,
 			}
+			// The SDK forwards per-series start times when OTEL_GO_X_PER_SERIES_START_TIMESTAMPS is
+			// set, and v1.47.0 has no option to turn that off. Every cumulative point therefore
+			// reports the one start time fixed when the provider was built.
 			for _, point := range sum.DataPoints {
 				value.DataPoints = append(value.DataPoints, &metricpb.NumberDataPoint{
 					Attributes:        otlpAttributes(point.Attributes.ToSlice()),
-					StartTimeUnixNano: uint64(point.StartTime.UnixNano()),
+					StartTimeUnixNano: uint64(w.start.UnixNano()),
 					TimeUnixNano:      uint64(point.Time.UnixNano()),
 					Value:             &metricpb.NumberDataPoint_AsInt{AsInt: point.Value},
 				})

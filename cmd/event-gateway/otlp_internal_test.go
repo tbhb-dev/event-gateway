@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/go-logr/logr/funcr"
 	"go.opentelemetry.io/otel"
@@ -180,7 +181,11 @@ func TestOTLPFailureKeepsWebhookAccepted(t *testing.T) {
 	unusedMetric := &metricdata.ResourceMetrics{
 		ScopeMetrics: []metricdata.ScopeMetrics{{Metrics: []metricdata.Metrics{{}}}},
 	}
-	checkEqual(t, (otlpMetrics{writer}).Export(t.Context(), unusedMetric), errOTLPExport)
+	checkEqual(
+		t,
+		(otlpMetrics{otlpWriter: writer, start: time.Time{}}).Export(t.Context(), unusedMetric),
+		errOTLPExport,
+	)
 	checkEqual(t, writer.send(t.Context(), "traces", otlpString("\xff")), errOTLPExport)
 
 	writer.endpoint.Host = "invalid host"
@@ -189,10 +194,14 @@ func TestOTLPFailureKeepsWebhookAccepted(t *testing.T) {
 
 var errFixtureExport = errors.New("collector reported " + collectorToken)
 
-//nolint:paralleltest // Environment variables are process-wide.
-func TestOTLPIgnoresOTELVariables(t *testing.T) {
+const enabled = "true"
+
+// setOTELVariables sets every OTEL_* variable that could change the exported telemetry.
+func setOTELVariables(t *testing.T) {
+	t.Helper()
+
 	for key, value := range map[string]string{
-		"OTEL_SDK_DISABLED":               "true",
+		"OTEL_SDK_DISABLED":               enabled,
 		"OTEL_TRACES_SAMPLER":             "always_off",
 		"OTEL_RESOURCE_ATTRIBUTES":        "env.leak=yes,service.name=env-service",
 		"OTEL_SERVICE_NAME":               "env-service",
@@ -200,15 +209,29 @@ func TestOTLPIgnoresOTELVariables(t *testing.T) {
 		"OTEL_BSP_MAX_QUEUE_SIZE":         "1",
 		"OTEL_BLRP_MAX_QUEUE_SIZE":        "1",
 		"OTEL_METRIC_EXPORT_INTERVAL":     "1",
-		"OTEL_METRICS_EXEMPLAR_FILTER":    "always_off",
+		"OTEL_METRICS_EXEMPLAR_FILTER":    "always_on",
+		"OTEL_METRIC_EXPORT_TIMEOUT":      "1",
+		"OTEL_BSP_SCHEDULE_DELAY":         "1",
+		"OTEL_BLRP_SCHEDULE_DELAY":        "1",
+		"OTEL_GO_X_CARDINALITY_LIMIT":     "1",
+		"OTEL_GO_X_OBSERVABILITY":         enabled,
+
+		"OTEL_GO_X_PER_SERIES_START_TIMESTAMPS": enabled,
 	} {
 		t.Setenv(key, value)
 	}
+}
+
+//nolint:paralleltest // Environment variables are process-wide.
+func TestOTLPIgnoresOTELVariables(t *testing.T) {
+	setOTELVariables(t)
 
 	var (
 		lock    sync.Mutex
 		traces  traceexport.ExportTraceServiceRequest
 		metrics metricexport.ExportMetricsServiceRequest
+		early   = map[string]int{}
+		closed  bool
 	)
 
 	collector := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
@@ -217,6 +240,10 @@ func TestOTLPIgnoresOTELVariables(t *testing.T) {
 
 		lock.Lock()
 		defer lock.Unlock()
+
+		if !closed {
+			early[request.URL.Path]++
+		}
 
 		switch request.URL.Path {
 		case "/v1/traces":
@@ -234,10 +261,26 @@ func TestOTLPIgnoresOTELVariables(t *testing.T) {
 	})
 	checkError(t, err)
 
+	opened := time.Now()
 	hook := &githubWebhook{
 		store: testStore(t, retention), telemetry: signals, secret: []byte(fixtureKey), bodyCap: defaultBodyCap,
 	}
+	// Two series (202 and 409), created after the provider, so per-series start times would differ.
 	expectStatus(t, hook.ServeHTTP, signedRequest(t.Context(), issuesEvent, "1", "{}"), http.StatusAccepted)
+	time.Sleep(20 * time.Millisecond)
+
+	conflict := signedRequest(t.Context(), issuesEvent, "1", `{"text":"x"}`)
+	expectStatus(t, hook.ServeHTTP, conflict, http.StatusConflict)
+
+	// The pinned one-minute reader interval and batch delays keep every signal queued until shutdown.
+	// A 1ms interval or delay from the environment would export within this wait.
+	time.Sleep(200 * time.Millisecond)
+	lock.Lock()
+	checkEqual(t, len(early), 0)
+
+	closed = true
+
+	lock.Unlock()
 	closeSignals()
 
 	lock.Lock()
@@ -246,7 +289,7 @@ func TestOTLPIgnoresOTELVariables(t *testing.T) {
 	// The sampler keeps the span and the attribute limit keeps its attributes.
 	checkEqual(t, len(traces.GetResourceSpans()), 1)
 	spans := traces.GetResourceSpans()[0]
-	checkEqual(t, len(spans.GetScopeSpans()[0].GetSpans()), 1)
+	checkEqual(t, len(spans.GetScopeSpans()[0].GetSpans()), 2)
 	checkEqual(t, len(spans.GetScopeSpans()[0].GetSpans()[0].GetAttributes()), 2)
 
 	// The resource holds only the explicit service name.
@@ -261,5 +304,21 @@ func TestOTLPIgnoresOTELVariables(t *testing.T) {
 
 	metric := metrics.GetResourceMetrics()[0].GetScopeMetrics()[0].GetMetrics()[0]
 	checkEqual(t, metric.GetName(), "event_gateway_ingest_total")
-	checkEqual(t, metric.GetSum().GetDataPoints()[0].GetAsInt(), int64(1))
+
+	// The pinned cardinality limit keeps both series; a limit of 1 would fold one into an overflow series.
+	points := metric.GetSum().GetDataPoints()
+	checkEqual(t, len(points), 2)
+
+	// The wire start time is one explicit value, never the SDK's per-series start time. It is the
+	// provider's creation time, so it cannot be later than the first webhook request.
+	for _, point := range points {
+		checkEqual(t, point.GetAsInt(), int64(1))
+		checkEqual(t, point.GetStartTimeUnixNano(), points[0].GetStartTimeUnixNano())
+		checkEqual(t, point.GetStartTimeUnixNano() <= uint64(opened.UnixNano()), true)
+		checkEqual(t, len(point.GetAttributes()), 2)
+	}
+
+	// Pins with no observable effect here: the metric exemplar filter (the exporter does not
+	// forward exemplars) and OTEL_METRIC_EXPORT_TIMEOUT (a local collector replies too fast to
+	// time out reliably).
 }
