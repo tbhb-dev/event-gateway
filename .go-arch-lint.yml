@@ -14,6 +14,7 @@ components:
   cmd: {in: cmd/*}
   eventfields: {in: internal/eventfields}
   filter: {in: internal/filter}
+  routing: {in: internal/routing}
 
 vendors:
   nats:
@@ -36,3 +37,5 @@ deps:
     mayDependOn: [eventfields, filter]
   filter:
     mayDependOn: [filter]
+  routing:
+    mayDependOn: [routing, filter]
