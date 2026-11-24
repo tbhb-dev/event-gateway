@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -16,9 +17,11 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/nats-io/nats.go"
 )
 
-const maxGitHubBody = 25 << 20
+const defaultBodyCap = 5 << 20
 
 const (
 	webhookPath    = "/webhooks/github"
@@ -41,14 +44,21 @@ type envelope struct {
 	Repository *string `json:"repository"`
 	ReceivedAt string  `json:"received_at"`
 	Payload    []byte  `json:"-"`
+	projected  []byte
 }
 
 func (event envelope) encode() []byte {
 	//nolint:errcheck,errchkjson // Envelope metadata contains only strings and null.
 	data, _ := json.Marshal(event)
-	// The payload is already JSON. Appending it preserves the signed bytes.
+
+	payload := event.Payload
+	if event.projected != nil {
+		payload = event.projected
+	}
+
+	// Append the retained JSON directly so full payloads keep their signed bytes.
 	data = append(data[:len(data)-1], `,"payload":`...)
-	data = append(data, event.Payload...)
+	data = append(data, payload...)
 
 	return append(data, '}')
 }
@@ -109,6 +119,17 @@ type githubWebhook struct {
 	bodyCap   int
 }
 
+var errSecret = errors.New("GitHub webhook secret is required and must contain a non-whitespace character")
+
+func newGitHubWebhook(secret []byte, bodyCap int) (*githubWebhook, error) {
+	if len(bytes.TrimSpace(secret)) == 0 {
+		return nil, errSecret
+	}
+
+	//nolint:exhaustruct_v5 // Serve opens and attaches the store and telemetry after validating the secret.
+	return &githubWebhook{secret: secret, bodyCap: bodyCap}, nil
+}
+
 func (h *githubWebhook) ServeHTTP(response http.ResponseWriter, request *http.Request) {
 	path := request.URL.EscapedPath()
 
@@ -128,6 +149,13 @@ func (h *githubWebhook) receive(response http.ResponseWriter, request *http.Requ
 
 	event, status := h.ingest(response, request.WithContext(ctx))
 	h.telemetry.record(ctx, span, event, status)
+
+	if status == http.StatusRequestEntityTooLarge {
+		http.Error(response, "GitHub webhook body exceeds the store limit", status)
+
+		return
+	}
+
 	response.WriteHeader(status)
 }
 
@@ -135,30 +163,41 @@ func (h *githubWebhook) ingest(response http.ResponseWriter, request *http.Reque
 	receivedAt := time.Now().UTC()
 	signature := request.Header.Get("X-Hub-Signature-256")
 
+	// The signature covers the body, not the headers, so only a well-formed
+	// event name is recorded.
+	event := request.Header.Get(eventHeader)
+	if !githubEvent.MatchString(event) {
+		event = ""
+	}
+
 	digest, err := decodeSignature(signature)
 	if err != nil {
 		return "", http.StatusUnauthorized
 	}
 
-	body, err := io.ReadAll(http.MaxBytesReader(response, request.Body, maxGitHubBody))
+	body, err := io.ReadAll(http.MaxBytesReader(response, request.Body, maxPayload))
 	if err != nil {
 		_, tooLarge := errors.AsType[*http.MaxBytesError](err)
 		if tooLarge {
-			return "", http.StatusRequestEntityTooLarge
+			return event, http.StatusRequestEntityTooLarge
 		}
 
-		return "", http.StatusBadRequest
+		return event, http.StatusBadRequest
 	}
 
 	if !verifySignature(h.secret, body, digest) {
 		return "", http.StatusUnauthorized
 	}
 
-	event := request.Header.Get(eventHeader)
 	delivery := request.Header.Get(deliveryHeader)
 
-	if !githubEvent.MatchString(event) || !githubDelivery.MatchString(delivery) {
-		return "", http.StatusBadRequest
+	err = validateEvent(event, body)
+	if err != nil {
+		return event, h.publishStatus(request.Context(), err)
+	}
+
+	if !githubDelivery.MatchString(delivery) {
+		return event, http.StatusBadRequest
 	}
 
 	normalized, err := normalizeGitHub(event, delivery, receivedAt, body, h.bodyCap)
@@ -170,8 +209,7 @@ func (h *githubWebhook) ingest(response http.ResponseWriter, request *http.Reque
 		return event, http.StatusAccepted
 	}
 
-	hash := sha256.Sum256(body)
-	err = h.store.publish(request.Context(), normalized, hex.EncodeToString(hash[:]))
+	err = h.store.publish(request.Context(), normalized)
 
 	return event, h.publishStatus(request.Context(), err)
 }
@@ -180,6 +218,10 @@ func (h *githubWebhook) publishStatus(ctx context.Context, err error) int {
 	switch {
 	case err == nil:
 		return http.StatusAccepted
+	case errors.Is(err, errInvalidEvent), errors.Is(err, errEmptyPayload):
+		return http.StatusBadRequest
+	case errors.Is(err, nats.ErrMaxPayload):
+		return http.StatusRequestEntityTooLarge
 	case errors.Is(err, errBodyConflict):
 		h.telemetry.logger.WarnContext(ctx, "GitHub delivery already has a different body")
 
@@ -230,10 +272,11 @@ func normalizeGitHub(event, delivery string, receivedAt time.Time, body []byte, 
 		Repository: scope.Repository.FullName,
 		ReceivedAt: receivedAt.Format(time.RFC3339Nano),
 		Payload:    body,
+		projected:  nil,
 	}
 
 	if len(body) > bodyCap {
-		message.Payload, err = truncateGitHub(body)
+		message.projected, err = truncateGitHub(body)
 	}
 
 	return message, err

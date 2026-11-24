@@ -21,11 +21,11 @@ const (
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	err := run(ctx, os.Stdout, os.Args[1:])
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
+	err := run(ctx, os.Stdout, logger.Handler(), os.Args[1:])
 
 	stop()
 
-	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 	os.Exit(exitCode(ctx, logger, err))
 }
 
@@ -39,7 +39,7 @@ func exitCode(ctx context.Context, logger *slog.Logger, err error) int {
 	return 0
 }
 
-func run(ctx context.Context, out io.Writer, args []string) error {
+func run(ctx context.Context, out io.Writer, logHandler slog.Handler, args []string) error {
 	if len(args) == 0 {
 		_, err := fmt.Fprintf(out, "event-gateway %s\n", version)
 		if err != nil {
@@ -53,5 +53,5 @@ func run(ctx context.Context, out io.Writer, args []string) error {
 		return errUsage
 	}
 
-	return serve(ctx, out, args[1:])
+	return serve(ctx, out, logHandler, args[1:])
 }
