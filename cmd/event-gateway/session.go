@@ -80,7 +80,7 @@ func (api *sessionAPI) connect(writer http.ResponseWriter, req *http.Request) {
 
 		api.telemetry.logger.InfoContext(req.Context(), "session connected", "token.name", name)
 
-		state := session{conn: conn, stream: api.store.stream, events: make(chan jetstream.Msg), subscriptions: nil}
+		state := session{conn: conn, stream: api.store.stream, events: nil, subscriptions: nil}
 		code, reason := api.run(req.Context(), &state, sha256.Sum256([]byte(strings.Fields(header)[1])))
 		_ = conn.Close(code, reason)
 	}
@@ -129,7 +129,7 @@ func (api *sessionAPI) run(ctx context.Context, peer *session, hash [sha256.Size
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
 
-	var deadline <-chan time.Time
+	deadline := time.After(api.helloWait)
 
 	var live <-chan jetstream.Msg
 
@@ -150,19 +150,20 @@ func (api *sessionAPI) run(ctx context.Context, peer *session, hash [sha256.Size
 				return websocket.CloseStatus(frame.err), ""
 			}
 
-			reply := peer.command(ctx, frame, deadline == nil, live == nil)
-			switch {
-			case reply[typeKey] == helloKind:
+			reply := peer.command(ctx, frame, live == nil)
+			if reply[typeKey] == helloKind {
 				deadline = nil
 				live = peer.events
-			case deadline == nil && reply == nil:
-				deadline = time.After(api.helloWait)
 			}
 
 			if reply != nil {
 				err = peer.write(ctx, reply)
 			}
 		case event := <-live:
+			if (*api.tokens.set.Load())[hash] == "" {
+				return tokenRevoked, "token revoked"
+			}
+
 			err = peer.deliver(ctx, event)
 		}
 
@@ -175,16 +176,19 @@ func (api *sessionAPI) run(ctx context.Context, peer *session, hash [sha256.Size
 // sessionReply sends the subscription count for hello and echoes valid request IDs.
 type sessionReply map[string]any
 
-func (s *session) command(ctx context.Context, frame sessionFrame, first, waiting bool) sessionReply {
-	if frame.kind == websocket.MessageText && string(frame.data) == `{"type":"ping"}` {
-		return sessionReply{typeKey: "pong"}
-	}
+type sessionObject map[string]json.RawMessage
 
-	object := sessionJSON[map[string]json.RawMessage](frame.data)
+func (s *session) command(ctx context.Context, frame sessionFrame, waiting bool) sessionReply {
+	object := sessionJSON[sessionObject](frame.data)
+	kind := sessionJSON[string](object[typeKey])
 	reply := errorReply(badFrame, "unexpected message")
 
-	if frame.kind == websocket.MessageText && sessionJSON[string](object[typeKey]) == helloKind && waiting {
-		reply = s.hello(ctx, object, first)
+	switch {
+	case frame.kind != websocket.MessageText:
+	case kind == "ping":
+		reply = sessionReply{typeKey: "pong"}
+	case kind == helloKind && waiting:
+		reply = s.hello(ctx, object)
 	}
 
 	id := sessionJSON[string](object["id"])
@@ -208,7 +212,7 @@ func errorReply(code, msg string) sessionReply {
 	return sessionReply{typeKey: "error", codeKey: code, "message": msg}
 }
 
-func (s *session) hello(ctx context.Context, object map[string]json.RawMessage, first bool) sessionReply {
+func (s *session) hello(ctx context.Context, object sessionObject) sessionReply {
 	more := string(object["more"])
 	raw := sessionJSON[[]json.RawMessage](object[subsKey])
 
@@ -237,7 +241,7 @@ func (s *session) hello(ctx context.Context, object map[string]json.RawMessage, 
 
 	// Creating the consumer sets the live boundary. The run loop starts
 	// receiving its events after the final hello, once all filters are known.
-	if first && !s.consume(ctx) {
+	if s.events == nil && !s.consume(ctx) {
 		return errorReply(badFrame, "stream unavailable")
 	}
 
@@ -259,6 +263,7 @@ func (s *session) consume(ctx context.Context) bool {
 		return false
 	}
 
+	s.events = make(chan jetstream.Msg)
 	send := func(msg jetstream.Msg) {
 		select {
 		case s.events <- msg:
