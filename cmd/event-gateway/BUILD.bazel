@@ -11,6 +11,7 @@ go_library(
     srcs = [
         "github.go",
         "grafana.go",
+        "healthcheck.go",
         "main.go",
         "otlp.go",
         "read.go",
@@ -64,6 +65,7 @@ go_test(
     srcs = [
         "github_internal_test.go",
         "grafana_internal_test.go",
+        "healthcheck_internal_test.go",
         "main_internal_test.go",
         "otlp_internal_test.go",
         "read_internal_test.go",

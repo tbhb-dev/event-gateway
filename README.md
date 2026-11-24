@@ -6,6 +6,12 @@ Status: pre-alpha.
 
 The design is in tbhb-dev/wiki under [designs/event-gateway](https://github.com/tbhb-dev/wiki/tree/main/designs/event-gateway).
 
+## Healthcheck
+
+`event-gateway healthcheck [-addr HOST:PORT]` requests `GET /healthz` (default `127.0.0.1:8080`, 4 second timeout) and exits 0 only on HTTP 200.
+It prints nothing on success and exits 1 otherwise.
+The distroless image uses it for the container healthcheck.
+
 ## Read API
 
 Enable the read API with `event-gateway serve -read-listen ADDRESS -read-token-file FILE`.
