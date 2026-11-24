@@ -14,10 +14,9 @@ import (
 func TestHealthcheck(t *testing.T) {
 	t.Parallel()
 
-	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/healthz" || r.Method != http.MethodGet {
-			w.WriteHeader(http.StatusNotFound)
-		}
+	healthy := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		checkEqual(t, r.URL.Path, "/healthz")
+		checkEqual(t, r.Method, http.MethodGet)
 	}))
 	t.Cleanup(healthy.Close)
 
@@ -30,6 +29,14 @@ func TestHealthcheck(t *testing.T) {
 		}
 	}))
 	t.Cleanup(bad.Close)
+
+	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	t.Cleanup(target.Close)
+
+	redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusFound)
+	}))
+	t.Cleanup(redirect.Close)
 
 	gone := httptest.NewServer(http.NotFoundHandler())
 	closed := strings.TrimPrefix(gone.URL, "http://")
@@ -45,6 +52,13 @@ func TestHealthcheck(t *testing.T) {
 	}{
 		{"success", []string{"-addr", okAddr}, false},
 		{"non-200", []string{"-addr=" + badAddr}, true},
+		{"redirect", []string{"-addr=" + strings.TrimPrefix(redirect.URL, "http://")}, true},
+		{"empty address", []string{"-addr="}, true},
+		{"path", []string{"-addr=127.0.0.1:80/healthz"}, true},
+		{"host path", []string{"-addr=127.0.0.1/x:80"}, true},
+		{"query", []string{"-addr=127.0.0.1:80?x=1"}, true},
+		{"fragment", []string{"-addr=127.0.0.1:80#x"}, true},
+		{"whitespace", []string{"-addr=127.0.0.1 :80"}, true},
 		{"refused", []string{"-addr=" + closed}, true},
 		{"bad address", []string{"-addr=bad host"}, true},
 		{"unknown flag", []string{"-nope"}, true},
