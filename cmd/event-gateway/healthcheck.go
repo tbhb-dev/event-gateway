@@ -9,7 +9,6 @@ import (
 	"flag"
 	"io"
 	"net/http"
-	"net/url"
 	"time"
 )
 
@@ -39,9 +38,8 @@ func healthcheck(ctx context.Context, args []string) error {
 	ctx, cancel := context.WithTimeout(ctx, healthcheckTimeout)
 	defer cancel()
 
-	target := url.URL{Scheme: "http", Host: *addr, Path: "/healthz"}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
+	// NewRequestWithContext parses the URL; a malformed address fails here.
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+*addr+"/healthz", nil)
 	if err != nil {
 		return errHealthcheck
 	}
