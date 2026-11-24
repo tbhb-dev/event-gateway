@@ -83,6 +83,7 @@ nogo(
 GO_TARGETS = [
     "//cmd/event-gateway",
     "//cmd/event-gateway:event-gateway_test",
+    "//internal/filter:filter_test",
 ]
 
 golangci_lint_test(
@@ -124,6 +125,14 @@ gobco_test(
     go_sum = "go.sum",
     proxy = "@go_mod_proxy//:proxy",
     tests = ["//cmd/event-gateway:event-gateway_test"],
+)
+
+gobco_test(
+    name = "filter_gobco_test",
+    go_mod = "go.mod",
+    go_sum = "go.sum",
+    proxy = "@go_mod_proxy//:proxy",
+    tests = ["//internal/filter:filter_test"],
 )
 
 # Every file of the repository, for the whole-tree checks below. Each package
