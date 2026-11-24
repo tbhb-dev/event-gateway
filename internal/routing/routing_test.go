@@ -4,7 +4,10 @@
 package routing_test
 
 import (
+	"errors"
+	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -98,9 +101,10 @@ func TestLoadErrors(t *testing.T) {
 		{rules(strings.Replace(rule, action, "", 1)), ruleErr + " action"},
 		{rules(strings.Replace(rule, match, `"match":[]`, 1)), ruleErr + " match"},
 		{matchConfig(grafana + `,"extra":1`), ruleErr + " match: unknown key"},
-		{matchConfig(`"event":"firing"`), `event "firing": provider`},
 		{matchConfig(`"provider":"grafana"`), "event: expected 1 to 16 entries"},
-		{matchConfig(`"provider":"grafana","event":[` + strings.Repeat(`"firing",`, 16) + `"firing"]`), "expected 1 to 16"},
+		{matchConfig(`"provider":"grafana","event":` + events(17, 0)), "event: expected 1 to 16 entries"},
+		{config(strings.TrimSuffix(target, "}") + `,"start":null}`), targetErr + " start"},
+		{config(strings.TrimSuffix(target, "}") + `,"connection":null}`), targetErr + " connection"},
 		{matchConfig(`"provider":"grafana","event":"firing.alert"`), "event: invalid entry"},
 		{matchConfig(`"provider":"github","event":"push"`), pushError},
 		{matchConfig(grafana + `,"repository":["org"]`), "repository: invalid entry"},
@@ -114,6 +118,35 @@ func TestLoadErrors(t *testing.T) {
 			t.Fatalf("Load(%s) = %v, want error containing %q", test.raw, err, test.want)
 		}
 	}
+}
+
+func TestLoadEvents(t *testing.T) {
+	t.Parallel()
+
+	for _, list := range []string{events(16, 1), events(16, 16)} {
+		load(t, matchConfig(`"provider":"grafana","event":`+list))
+	}
+
+	_, err := routing.Load([]byte(matchConfig(`"event":"firing"`)))
+
+	var filterErr *filter.Error
+	if !errors.As(err, &filterErr) || !strings.Contains(err.Error(), `event "firing"`) {
+		t.Fatalf("Load without provider = %v, want *filter.Error naming the event", err)
+	}
+}
+
+// events returns a JSON list of unique event names followed by repeats of the first.
+func events(unique, repeats int) string {
+	names := make([]string, 0, unique+repeats)
+	for i := range unique {
+		names = append(names, fmt.Sprintf("%q", "e"+strconv.Itoa(i)))
+	}
+
+	for range repeats {
+		names = append(names, `"e0"`)
+	}
+
+	return "[" + strings.Join(names, ",") + "]"
 }
 
 func TestMatches(t *testing.T) {
@@ -173,6 +206,7 @@ func TestScopesAndSubjects(t *testing.T) {
 		{githubProvider, push, "tEAm/repo", 1, true},
 		{githubProvider, push, "team-x/repo", 0, false},
 		{githubProvider, push, "team/", 0, false},
+		{githubProvider, push, "team/a/b", 0, false},
 		{githubProvider, push, "", 0, false},
 		{githubProvider, "release", "org/repo", 0, false},
 		{grafanaProvider, push, "org/repo", 0, false},
