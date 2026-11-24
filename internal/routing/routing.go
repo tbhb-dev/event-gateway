@@ -180,6 +180,10 @@ func compileMatch(rule *Rule, raw json.RawMessage) error {
 		events = []string{decode[string](eventJSON)}
 	}
 
+	slices.Sort(events)
+
+	events = slices.Compact(events)
+
 	err = validateTokens(events, maxEvents, eventPattern)
 	if err != nil {
 		return fmt.Errorf("event: %w", err)
@@ -201,9 +205,8 @@ func compileMatch(rule *Rule, raw json.RawMessage) error {
 	}
 
 	rule.events = make(map[string]filter.Subscription, len(events))
-	slices.Sort(events)
 
-	for _, event := range slices.Compact(events) {
+	for _, event := range events {
 		object["event"] = json.RawMessage(`"` + event + `"`)
 		//nolint:errcheck,errchkjson // Every value is valid raw JSON.
 		data, _ := json.Marshal(object)
@@ -286,7 +289,7 @@ func (r Rule) matchesRepository(repository string) bool {
 
 	return len(r.repositories) == 0 || slices.ContainsFunc(r.repositories, func(entry string) bool {
 		if prefix, wildcard := strings.CutSuffix(entry, "/*"); wildcard {
-			return name != "" && strings.EqualFold(owner, prefix)
+			return name != "" && !strings.Contains(name, "/") && strings.EqualFold(owner, prefix)
 		}
 
 		return strings.EqualFold(entry, repository)
