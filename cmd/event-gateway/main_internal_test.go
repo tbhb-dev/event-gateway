@@ -186,7 +186,7 @@ func exerciseServe(t *testing.T, collectorFlags []string) {
 	args := append(
 		[]string{
 			serveCommand, "-listen=" + address, storeDirFlag + dir, "-github-secret-file=" + file,
-			testReadListen, "-read-token-file=" + tokens,
+			testReadListen, "-read-token-file=" + tokens, "-grafana-secret-file=" + file,
 		},
 		collectorFlags...,
 	)

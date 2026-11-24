@@ -41,6 +41,8 @@ type serveConfig struct {
 	otlp       otlpConfig
 	secret     *string
 	secretFile *string
+	grafSecret *string
+	grafFile   *string
 	readListen string
 	tokenFile  string
 	listen     string
@@ -65,6 +67,16 @@ func (cfg *serveConfig) parse(out io.Writer, args []string) error {
 	})
 	flags.Func("github-secret-file", "GitHub secret file (before GITHUB_WEBHOOK_SECRET)", func(value string) error {
 		cfg.secretFile = &value
+
+		return nil
+	})
+	flags.Func("grafana-secret", "Grafana webhook secret; enables the Grafana route", func(value string) error {
+		cfg.grafSecret = &value
+
+		return nil
+	})
+	flags.Func("grafana-secret-file", "Grafana secret file; enables the Grafana route", func(value string) error {
+		cfg.grafFile = &value
 
 		return nil
 	})
@@ -119,18 +131,23 @@ func (cfg *serveConfig) parse(out io.Writer, args []string) error {
 }
 
 func (cfg *serveConfig) loadSecret() ([]byte, error) {
+	return readSecret(cfg.secret, cfg.secretFile, "GITHUB_WEBHOOK_SECRET")
+}
+
+// readSecret takes the flag value, then the file, then the environment.
+func readSecret(value, file *string, env string) ([]byte, error) {
 	switch {
-	case cfg.secret != nil:
-		return []byte(*cfg.secret), nil
-	case cfg.secretFile != nil:
-		secret, err := os.ReadFile(*cfg.secretFile)
+	case value != nil:
+		return []byte(*value), nil
+	case file != nil:
+		secret, err := os.ReadFile(*file)
 		if err != nil {
-			return nil, fmt.Errorf("read GitHub secret file: %w", err)
+			return nil, fmt.Errorf("read secret file: %w", err)
 		}
 
 		return bytes.TrimRight(secret, "\r\n"), nil
 	default:
-		return []byte(os.Getenv("GITHUB_WEBHOOK_SECRET")), nil
+		return []byte(os.Getenv(env)), nil
 	}
 }
 
@@ -166,6 +183,11 @@ func serve(ctx context.Context, out io.Writer, logHandler slog.Handler, args []s
 		return err
 	}
 
+	grafana, err := cfg.grafanaHandler()
+	if err != nil {
+		return err
+	}
+
 	options := storeOptions(cfg.storeDir)
 	options.JetStreamMaxMemory = cfg.maxMemory
 	options.JetStreamMaxStore = cfg.maxStore
@@ -187,7 +209,7 @@ func serve(ctx context.Context, out io.Writer, logHandler slog.Handler, args []s
 	handler.store = store
 	handler.telemetry = signals
 
-	webhook := gatewayHTTP(cfg.listen, handler)
+	webhook := gatewayHTTP(cfg.listen, withGrafana(grafana, handler, store, signals))
 	if cfg.readListen == "" {
 		return runHTTPServer(ctx, webhook)
 	}
