@@ -16,7 +16,14 @@ vendors:
   nats:
     in: [github.com/nats-io/nats-server/v2/**, github.com/nats-io/nats.go, github.com/nats-io/nats.go/**]
   telemetry:
-    in: [go.opentelemetry.io/otel, go.opentelemetry.io/otel/**]
+    in:
+      - github.com/go-logr/logr
+      - github.com/go-logr/logr/funcr
+      - go.opentelemetry.io/contrib/bridges/otelslog
+      - go.opentelemetry.io/otel
+      - go.opentelemetry.io/otel/**
+      - go.opentelemetry.io/proto/otlp/**
+      - google.golang.org/protobuf/proto
 
 deps:
   cmd:

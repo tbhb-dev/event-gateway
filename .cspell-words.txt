@@ -192,3 +192,16 @@ metricnoop
 sdkmetric
 tracenoop
 tracetest
+commonpb
+funcr
+genproto
+logexport
+logpb
+metricexport
+metricpb
+otelslog
+otlptrace
+resourcepb
+sdklog
+traceexport
+tracepb
