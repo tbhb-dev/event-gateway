@@ -163,16 +163,22 @@ func validateEvent(name string, payload []byte) error {
 }
 
 func (s eventStore) publish(ctx context.Context, event envelope) error {
-	err := validateEvent(event.Event, event.Payload)
+	// Grafana events are alert.<status>, a fixed pair of subject tokens.
+	name := event.Event
+	if event.Provider == grafanaProvider {
+		name = strings.ReplaceAll(name, ".", "_")
+	}
+
+	err := validateEvent(name, event.Payload)
 	if err != nil {
 		return err
 	}
 
 	sum := sha256.Sum256(event.Payload)
 	hash := hex.EncodeToString(sum[:])
-	msg := nats.NewMsg("events.github." + event.Event)
+	msg := nats.NewMsg("events." + event.Provider + "." + event.Event)
 	msg.Data = event.encode()
-	msg.Header.Set(nats.MsgIdHdr, "github:"+event.Delivery)
+	msg.Header.Set(nats.MsgIdHdr, event.Provider+":"+event.Delivery)
 	msg.Header.Set(bodyHashKey, hash)
 
 	err = s.publishChecked(ctx, msg, hash)

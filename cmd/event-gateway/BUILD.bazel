@@ -10,6 +10,7 @@ go_library(
     name = "event-gateway_lib",
     srcs = [
         "github.go",
+        "grafana.go",
         "main.go",
         "otlp.go",
         "read.go",
@@ -61,6 +62,7 @@ go_test(
     name = "event-gateway_test",
     srcs = [
         "github_internal_test.go",
+        "grafana_internal_test.go",
         "main_internal_test.go",
         "otlp_internal_test.go",
         "read_internal_test.go",

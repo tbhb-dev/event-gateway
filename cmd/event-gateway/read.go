@@ -63,7 +63,8 @@ func (api readAPI) list(response http.ResponseWriter, request *http.Request) {
 	after, err := strconv.ParseUint(cmp.Or(query.Get("after"), "0"), decimal, 64)
 	provider, event := query.Get("provider"), query.Get("event")
 
-	if err != nil || strings.ContainsAny(provider+event, ".*> \t\r\n") {
+	if err != nil || strings.Contains(provider, ".") || strings.ContainsAny(provider+event, "*> \t\r\n") ||
+		event != "" && strings.Contains("."+event+".", "..") {
 		response.WriteHeader(http.StatusBadRequest)
 
 		return

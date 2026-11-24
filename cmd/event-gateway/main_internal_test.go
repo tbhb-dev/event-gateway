@@ -84,6 +84,14 @@ func TestServeRejectsInvalidSecret(t *testing.T) {
 	missingErr := run(t.Context(), io.Discard, slog.DiscardHandler, []string{serveCommand, storeDirFlag})
 	checkEqual(t, errors.Is(missingErr, errSecret), true)
 
+	testInvalidSecretSources(t, "github", "GITHUB_WEBHOOK_SECRET", errSecret)
+	t.Setenv("GITHUB_WEBHOOK_SECRET", fixtureKey)
+	testInvalidSecretSources(t, grafanaProvider, grafanaEnv, errGrafanaSecret)
+}
+
+func testInvalidSecretSources(t *testing.T, provider, env string, secretErr error) {
+	t.Helper()
+
 	dir := t.TempDir()
 	empty := filepath.Join(dir, "empty")
 	blank := filepath.Join(dir, "blank")
@@ -91,22 +99,23 @@ func TestServeRejectsInvalidSecret(t *testing.T) {
 	checkError(t, os.WriteFile(empty, nil, 0o600))
 	checkError(t, os.WriteFile(blank, []byte(" \t\r\n"), 0o600))
 
+	secretFlag := "-" + provider + "-secret"
 	for _, test := range []struct {
 		err  error
 		name string
 		env  string
 		args []string
 	}{
-		{errSecret, "empty environment", "", nil},
-		{errSecret, "blank environment", " \t", nil},
-		{errSecret, "empty flag", fixtureKey, []string{"-github-secret="}},
-		{errSecret, "blank flag", fixtureKey, []string{"-github-secret= \t"}},
-		{errSecret, "empty file", fixtureKey, []string{"-github-secret-file=" + empty}},
-		{errSecret, "blank file", fixtureKey, []string{"-github-secret-file=" + blank}},
-		{os.ErrNotExist, "missing file", fixtureKey, []string{"-github-secret-file=" + filepath.Join(dir, "missing")}},
+		{secretErr, "empty environment", "", nil},
+		{secretErr, "blank environment", " \t", nil},
+		{secretErr, "empty flag", fixtureKey, []string{secretFlag + "="}},
+		{secretErr, "blank flag", fixtureKey, []string{secretFlag + "= \t"}},
+		{secretErr, "empty file", fixtureKey, []string{secretFlag + "-file=" + empty}},
+		{secretErr, "blank file", fixtureKey, []string{secretFlag + "-file=" + blank}},
+		{os.ErrNotExist, "missing file", fixtureKey, []string{secretFlag + "-file=" + filepath.Join(dir, "missing")}},
 	} {
-		t.Run(test.name, func(t *testing.T) {
-			t.Setenv("GITHUB_WEBHOOK_SECRET", test.env)
+		t.Run(provider+"/"+test.name, func(t *testing.T) {
+			t.Setenv(env, test.env)
 
 			args := append([]string{serveCommand, storeDirFlag, "-listen=127.0.0.1:-1"}, test.args...)
 			err := run(t.Context(), io.Discard, slog.DiscardHandler, args)
@@ -153,16 +162,22 @@ func TestServeValidSecretAndContextShutdown(t *testing.T) {
 	t.Cleanup(collector.Close)
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", collector.URL)
 	t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "X-Collector-Test=test=value")
+	t.Setenv(grafanaEnv, "")
+	checkError(t, os.Unsetenv(grafanaEnv))
 
-	exerciseServe(t, nil)
+	file := filepath.Join(t.TempDir(), "secret")
+	checkError(t, os.WriteFile(file, []byte(fixtureKey+"\r\n"), 0o600))
+
+	exerciseServe(t, file, http.StatusNotFound)
 	checkEqual(t, exports.Load(), 0)
 
-	exerciseServe(t, []string{"-otlp-endpoint=" + collector.URL, "-otlp-header=X-Collector-Test=test=value"})
+	exerciseServe(t, file, http.StatusUnauthorized, "-grafana-secret-file="+file,
+		"-otlp-endpoint="+collector.URL, "-otlp-header=X-Collector-Test=test=value")
 	checkEqual(t, exports.Load() > 0, true)
 	checkEqual(t, sentHeader.Load(), true)
 }
 
-func exerciseServe(t *testing.T, collectorFlags []string) {
+func exerciseServe(t *testing.T, file string, grafanaStatus int, flags ...string) {
 	t.Helper()
 
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
@@ -177,9 +192,6 @@ func exerciseServe(t *testing.T, collectorFlags []string) {
 	checkError(t, listener.Close())
 
 	dir := t.TempDir()
-	file := filepath.Join(dir, "secret")
-	checkError(t, os.WriteFile(file, []byte(fixtureKey+"\r\n"), 0o600))
-
 	tokens := filepath.Join(dir, "tokens")
 	writeReadTokens(t, tokens, "reader", readFixture)
 
@@ -188,7 +200,7 @@ func exerciseServe(t *testing.T, collectorFlags []string) {
 			serveCommand, "-listen=" + address, storeDirFlag + dir, "-github-secret-file=" + file,
 			testReadListen, "-read-token-file=" + tokens,
 		},
-		collectorFlags...,
+		flags...,
 	)
 
 	var logs bytes.Buffer
@@ -230,10 +242,11 @@ func exerciseServe(t *testing.T, collectorFlags []string) {
 	webhook.URL.Scheme = "http"
 	webhook.URL.Host = address
 	webhook.Host = address
-	response, err := client.Do(webhook)
+	expectHTTPStatus(t, &client, webhook, http.StatusAccepted)
+
+	req, err = http.NewRequestWithContext(ctx, http.MethodPost, "http://"+address+grafanaPath, nil)
 	checkError(t, err)
-	checkError(t, response.Body.Close())
-	checkEqual(t, response.StatusCode, http.StatusAccepted)
+	expectHTTPStatus(t, &client, req, grafanaStatus)
 
 	cancel()
 
@@ -246,6 +259,15 @@ func exerciseServe(t *testing.T, collectorFlags []string) {
 
 	checkEqual(t, strings.Contains(logs.String(), fixtureKey), false)
 	checkEqual(t, strings.Contains(logs.String(), "private test payload"), false)
+}
+
+func expectHTTPStatus(t *testing.T, client *http.Client, req *http.Request, status int) {
+	t.Helper()
+
+	response, err := client.Do(req)
+	checkError(t, err)
+	checkError(t, response.Body.Close())
+	checkEqual(t, response.StatusCode, status)
 }
 
 func TestExitCode(t *testing.T) {

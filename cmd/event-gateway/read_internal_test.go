@@ -86,7 +86,7 @@ func TestReadEventRoutes(t *testing.T) {
 	writeReadTokens(t, tokens.path, "reader", readFixture)
 	checkError(t, tokens.load())
 
-	store := testStore(t, retention)
+	grafana, store := grafanaHook(t)
 	api := readAPI{tokens: &tokens, store: store, telemetry: newTelemetry(slog.DiscardHandler, nil, nil)}
 	header := "Bearer " + readFixture
 	hook := testWebhook(t, store, defaultBodyCap)
@@ -101,6 +101,7 @@ func TestReadEventRoutes(t *testing.T) {
 		expectStatus(t, hook.ServeHTTP, req, http.StatusAccepted)
 	}
 
+	expectStatus(t, grafana.ServeHTTP, grafanaSigned(t.Context(), alertsBody(hostAlert)), http.StatusAccepted)
 	checkError(t, store.stream.DeleteMsg(t.Context(), 1))
 	response := readRequest(t, api, eventsPath, header, http.StatusOK)
 
@@ -115,13 +116,20 @@ func TestReadEventRoutes(t *testing.T) {
 	response = readRequest(t, api, eventsPath+"?after=11&provider=github&event=issues", header, http.StatusOK)
 	checkEqual(t, strings.Contains(response.Body.String(), `"last_seq":12`), true)
 
+	response = readRequest(t, api, eventsPath+"?provider=grafana&event=alert.firing", header, http.StatusOK)
+	checkEqual(t, strings.Contains(response.Body.String(), `"provider":"grafana","event":"alert.firing"`), true)
+
 	for path, status := range map[string]int{
 		eventsPath + "?after=18446744073709551615": http.StatusOK,
 		eventsPath + "?after=bad":                  http.StatusBadRequest,
 		eventsPath + "?provider=*":                 http.StatusBadRequest,
+		eventsPath + "?provider=a.b":               http.StatusBadRequest,
+		eventsPath + "?event=alert.":               http.StatusBadRequest,
+		eventsPath + "?event=.x":                   http.StatusBadRequest,
+		eventsPath + "?event=a..b":                 http.StatusBadRequest,
 		eventsPath + "/0":                          http.StatusNotFound,
 		eventsPath + "/1":                          http.StatusGone,
-		eventsPath + "/13":                         http.StatusNotFound,
+		eventsPath + "/14":                         http.StatusNotFound,
 		eventsPath + "/bad":                        http.StatusBadRequest,
 	} {
 		readRequest(t, api, path, header, status)
