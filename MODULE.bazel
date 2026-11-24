@@ -84,6 +84,9 @@ use_repo(
     "tbhb_rules_zizmor",
 )
 
+runtime = use_extension("@tbhb_rules//runtime:extensions.bzl", "runtime", dev_dependency = True)
+use_repo(runtime, "tbhb_rules_python_runtime")
+
 go_deps = use_extension("@gazelle//:extensions.bzl", "go_deps")
 go_deps.from_file(go_mod = "//:go.mod")
 use_repo(

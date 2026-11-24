@@ -20,6 +20,7 @@ load(
     "rumdl_test",
     "ryl_test",
     "tombi_test",
+    "tree_check_test",
     "vale_sync",
     "vale_test",
     "zizmor_test",
@@ -223,6 +224,16 @@ editorconfig_checker_test(
 actionlint_test(
     name = "actionlint_test",
     srcs = [":repo_files"],
+)
+
+tree_check_test(
+    name = "merge_group_test",
+    srcs = [".github/workflows/ci.yml"],
+    target_compatible_with = select({
+        "@platforms//os:windows": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
+    tool = "//tools/lint:check_merge_group",
 )
 
 # Offline audits. The online ones need a token and the network; CI runs
