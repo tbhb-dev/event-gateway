@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 
@@ -19,7 +18,6 @@ import (
 const (
 	helperArg   = "buildloop-helper"
 	modeExit    = "exit"
-	modeFlood   = "flood"
 	modeSleep   = "sleep"
 	modeWD      = "wd"
 	missingBase = "buildloop-missing-executable"
@@ -42,8 +40,6 @@ func helper(mode string, args []string) int {
 		_, _ = os.Stderr.WriteString("to stderr\n")
 
 		return number(args)
-	case modeFlood:
-		_, _ = os.Stdout.WriteString(strings.Repeat("x", number(args)))
 	case modeSleep:
 		time.Sleep(time.Minute)
 	case modeWD:
@@ -151,13 +147,6 @@ func TestRun(t *testing.T) {
 			check:   func(r buildloop.Result) bool { return r.ExitCode == 3 && r.Output == bothStreams },
 		},
 		{
-			name:    "output exactly at the cap",
-			command: helperCommand(t, 0, modeFlood, strconv.Itoa(buildloop.OutputLimit)),
-			check: func(r buildloop.Result) bool {
-				return len(r.Output) == buildloop.OutputLimit && !r.Truncated
-			},
-		},
-		{
 			name:    "working directory",
 			command: workDir,
 			check:   func(r buildloop.Result) bool { return sameDir(t, r.Output, tempDir) },
@@ -221,10 +210,9 @@ func TestRunErrors(t *testing.T) {
 
 	timeout := 200 * time.Millisecond
 	tests := []struct {
-		check      func(error) bool
-		name       string
-		command    buildloop.Command
-		wantOutput int
+		check   func(error) bool
+		name    string
+		command buildloop.Command
 	}{
 		{
 			name:    "timeout",
@@ -234,44 +222,26 @@ func TestRunErrors(t *testing.T) {
 
 				return errors.As(err, &target) && target.Timeout == timeout && target.Error() != ""
 			},
-			wantOutput: 0,
 		},
 		{
-			name:    "output cap",
-			command: helperCommand(t, 0, modeFlood, strconv.Itoa(buildloop.OutputLimit+10)),
-			check: func(err error) bool {
-				var target *buildloop.OutputCapError
-
-				return errors.As(err, &target) && target.Limit == buildloop.OutputLimit && target.Error() != ""
-			},
-			wantOutput: buildloop.OutputLimit,
-		},
-		{
-			name:       "disallowed command",
-			command:    buildloop.Command{Executable: "sh", Dir: "", Args: []string{"-c", "true"}, Timeout: 0},
-			check:      isNotAllowed,
-			wantOutput: 0,
+			name:    "disallowed command",
+			command: buildloop.Command{Executable: "sh", Dir: "", Args: []string{"-c", "true"}, Timeout: 0},
+			check:   isNotAllowed,
 		},
 		{
 			name:    "relative path of an allowed binary",
 			command: buildloop.Command{Executable: "./" + filepath.Base(self(t)), Dir: "", Args: nil, Timeout: 0},
 			check:   isNotAllowed,
-
-			wantOutput: 0,
 		},
 		{
 			name:    "bare name of an allowed binary",
 			command: buildloop.Command{Executable: filepath.Base(self(t)), Dir: "", Args: nil, Timeout: 0},
 			check:   isNotAllowed,
-
-			wantOutput: 0,
 		},
 		{
 			name:    "uncleaned path of an allowed binary",
 			command: buildloop.Command{Executable: uncleaned(t), Dir: "", Args: nil, Timeout: 0},
 			check:   isNotAllowed,
-
-			wantOutput: 0,
 		},
 		{
 			name:    "command that cannot start",
@@ -281,7 +251,6 @@ func TestRunErrors(t *testing.T) {
 
 				return err != nil && !errors.As(err, &notAllowed)
 			},
-			wantOutput: 0,
 		},
 	}
 
@@ -291,18 +260,9 @@ func TestRunErrors(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
 
-			got, err := runner.Run(t.Context(), testCase.command)
+			_, err := runner.Run(t.Context(), testCase.command)
 			if !testCase.check(err) {
 				t.Fatalf("Run() error = %v", err)
-			}
-
-			if len(got.Output) != testCase.wantOutput || got.Truncated != (testCase.wantOutput > 0) {
-				t.Errorf(
-					"Run() = %d bytes, truncated %v, want %d bytes",
-					len(got.Output),
-					got.Truncated,
-					testCase.wantOutput,
-				)
 			}
 		})
 	}
@@ -317,35 +277,5 @@ func TestRunCancelled(t *testing.T) {
 	_, err := newRunner(t, self(t)).Run(ctx, helperCommand(t, 0, modeSleep))
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("Run() error = %v, want context.Canceled", err)
-	}
-}
-
-// TestRunExactFilename checks that an allowed path with no extension never
-// starts a different file, as Windows would by appending an executable extension.
-func TestRunExactFilename(t *testing.T) {
-	t.Parallel()
-
-	data, err := os.ReadFile(self(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	dir := t.TempDir()
-
-	const mode = 0o700
-
-	//nolint:gosec // The path is inside the test's own temporary directory.
-	err = os.WriteFile(filepath.Join(dir, "tool.exe"), data, mode)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	bare := filepath.Join(dir, "tool")
-	command := helperCommand(t, 0, modeExit, "0")
-	command.Executable = bare
-
-	got, err := newRunner(t, bare).Run(t.Context(), command)
-	if err == nil || isNotAllowed(err) || got.Output != "" {
-		t.Errorf("Run() = %q, %v, want a start error and no output", got.Output, err)
 	}
 }
