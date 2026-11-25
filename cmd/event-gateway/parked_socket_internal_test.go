@@ -8,18 +8,19 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"os"
-	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 )
 
 func TestParkedSocket(t *testing.T) {
 	ctx := t.Context()
-	dir := t.TempDir()
+	dir := shortSocketDir(t)
 	t.Chdir(dir)
 
 	const path = "s"
@@ -56,9 +57,21 @@ func TestParkedSocket(t *testing.T) {
 	cfg.storeDir = path
 	checkEqual(t, errors.Is(cfg.withParked(ctx, targets, nil), syscall.ENOTDIR), true)
 
-	closed, err := listenParked(ctx, filepath.Join(dir, "b"))
+	closed, err := listenParked(ctx, "b")
 	checkError(t, err)
-	_, err = secureParkedSocket(closed, filepath.Join(dir, "missing"))
+	_, err = secureParkedSocket(closed, "missing")
 	checkEqual(t, errors.Is(err, os.ErrNotExist), true)
-	clearStaleSocket(ctx, filepath.Join(dir, "missing", "s"))
+	clearStaleSocket(ctx, "missing/s")
+}
+
+func TestParkedSocketPathLimit(t *testing.T) {
+	t.Parallel()
+
+	const limit = len(syscall.RawSockaddrUnix{}.Path) - 1
+	// The listener adds "./" to the relative name before checking its length.
+	_, err := listenParked(t.Context(), strings.Repeat("s", limit-1))
+	checkEqual(t, errors.Is(err, syscall.ENAMETOOLONG), true)
+
+	want := fmt.Sprintf("parked socket path is %d bytes (limit %d):", limit+1, limit)
+	checkEqual(t, strings.HasPrefix(err.Error(), want), true)
 }

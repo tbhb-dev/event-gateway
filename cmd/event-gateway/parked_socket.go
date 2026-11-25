@@ -44,7 +44,15 @@ func (cfg *serveConfig) withParked(ctx context.Context, targets []runnerTarget, 
 }
 
 func listenParked(ctx context.Context, path string) (net.Listener, error) {
+	var raw syscall.RawSockaddrUnix
+
+	const limit = len(raw.Path) - 1 // Leave room for the terminating NUL.
+
 	address := parkedAddress(path)
+	if length := len(address); length > limit {
+		return nil, fmt.Errorf("parked socket path is %d bytes (limit %d): %w", length, limit, syscall.ENAMETOOLONG)
+	}
+
 	clearStaleSocket(ctx, address)
 
 	listener, err := new(net.ListenConfig).Listen(ctx, "unix", address)
