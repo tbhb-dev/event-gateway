@@ -9,8 +9,10 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -34,6 +36,7 @@ const (
 	helloKind         = "hello"
 	typeKey           = "type"
 	subsKey           = "subscriptions"
+	resumeKey         = "resume_after"
 	idLimit           = 64
 )
 
@@ -81,7 +84,7 @@ func (api *sessionAPI) connect(writer http.ResponseWriter, req *http.Request) {
 
 		api.telemetry.logger.InfoContext(req.Context(), "session connected", "token.name", name)
 
-		state := session{conn: conn, stream: api.store.stream, events: nil, subscriptions: nil}
+		state := session{conn: conn, stream: api.store.stream, events: nil, subscriptions: nil, replay: nil}
 		code, reason := api.run(req.Context(), &state, sha256.Sum256([]byte(strings.Fields(header)[1])))
 		_ = conn.Close(code, reason)
 	}
@@ -99,7 +102,14 @@ type session struct {
 	stream        jetstream.Stream
 	conn          *websocket.Conn
 	events        chan jetstream.Msg
+	replay        *sessionReplay
 	subscriptions []filter.Subscription
+}
+
+type sessionReplay struct {
+	gap     sessionReply
+	last    uint64
+	pending bool
 }
 
 type sessionFrame struct {
@@ -152,12 +162,12 @@ func (api *sessionAPI) run(ctx context.Context, peer *session, hash [sha256.Size
 			}
 
 			reply := peer.command(ctx, frame, live == nil)
-			if reply[typeKey] == helloKind {
+			switch {
+			case reply[typeKey] == helloKind:
 				deadline = nil
 				live = peer.events
-			}
-
-			if reply != nil {
+				err = peer.finishHello(ctx, reply)
+			case reply != nil:
 				err = peer.write(ctx, reply)
 			}
 		case event := <-live:
@@ -221,12 +231,23 @@ func (s *session) hello(ctx context.Context, object sessionObject) sessionReply 
 	raw := sessionJSON[[]json.RawMessage](object[subsKey])
 
 	switch {
-	case object["resume_after"] != nil || object["import"] != nil:
+	case object["import"] != nil:
 		return errorReply(badFrame, "resume_after and import are not supported yet")
 	case more != "" && more != "true" && more != "false", object[subsKey] != nil && raw == nil:
 		return errorReply(badFrame, "invalid hello fields")
 	case len(s.subscriptions)+len(raw) > subscriptionLimit:
 		return errorReply("limit", "too many subscriptions")
+	}
+
+	var resume *uint64
+
+	if cursor := object[resumeKey]; cursor != nil {
+		seq, err := strconv.ParseUint(string(cursor), decimal, 64)
+		if s.events != nil || err != nil {
+			return errorReply(badFrame, "invalid resume_after")
+		}
+
+		resume = &seq
 	}
 
 	subs := s.subscriptions
@@ -245,7 +266,7 @@ func (s *session) hello(ctx context.Context, object sessionObject) sessionReply 
 
 	// Creating the consumer sets the live boundary. The run loop starts
 	// receiving its events after the final hello, once all filters are known.
-	if s.events == nil && !s.consume(ctx) {
+	if s.events == nil && !s.consume(ctx, resume) {
 		return errorReply("internal", "stream unavailable")
 	}
 
@@ -258,13 +279,38 @@ func (s *session) hello(ctx context.Context, object sessionObject) sessionReply 
 	return sessionReply{typeKey: helloKind, subsKey: len(subs)}
 }
 
-func (s *session) consume(ctx context.Context) bool {
+func (s *session) consume(ctx context.Context, resume *uint64) bool {
 	//nolint:exhaustruct_v5 // Use the default ordered consumer configuration.
-	consumer, err := s.stream.OrderedConsumer(ctx, jetstream.OrderedConsumerConfig{
+	config := jetstream.OrderedConsumerConfig{
 		DeliverPolicy: jetstream.DeliverNewPolicy, InactiveThreshold: shutdownTimeout, MaxResetAttempts: 1,
-	})
+	}
+
+	var replay *sessionReplay
+
+	if resume != nil {
+		info, err := s.stream.Info(ctx)
+		if err != nil {
+			return false
+		}
+
+		replay = &sessionReplay{last: info.State.LastSeq, gap: nil, pending: false}
+		config.DeliverPolicy = jetstream.DeliverByStartSequencePolicy
+		// Saturate the start at MaxUint64 so it cannot wrap into retained history.
+		config.OptStartSeq = min(*resume, math.MaxUint64-1) + 1
+		if info.State.Msgs != 0 && config.OptStartSeq < info.State.FirstSeq {
+			replay.gap = sessionReply{typeKey: "gap", "from": config.OptStartSeq, "to": info.State.FirstSeq - 1}
+			config.OptStartSeq = info.State.FirstSeq
+		}
+	}
+
+	consumer, err := s.stream.OrderedConsumer(ctx, config)
 	if err != nil {
 		return false
+	}
+
+	if replay != nil {
+		replay.pending = *resume < replay.last && consumer.CachedInfo().NumPending != 0
+		s.replay = replay
 	}
 
 	s.events = make(chan jetstream.Msg)
@@ -298,32 +344,89 @@ func (s *session) deliver(ctx context.Context, message jetstream.Msg) error {
 		return io.EOF
 	}
 
+	matches := s.matches(message.Data())
+	if s.replay == nil && !matches {
+		return nil
+	}
+
+	meta, err := message.Metadata()
+	if err != nil {
+		return err //nolint:wrapcheck // The run loop converts delivery errors into the protocol close status.
+	}
+
+	var replies []any
+
+	// Pending counts can include new events. Use the snapshot to place the
+	// marker before the first live event, including when the boundary was deleted.
+	if s.replay != nil && meta.Sequence.Stream > s.replay.last {
+		replies = append(replies, s.caughtUp())
+	}
+
+	if matches {
+		replies = append(replies, sequenceEnvelope(meta.Sequence.Stream, message.Data()))
+	}
+
+	// A zero pending count also finishes replay when its tail is missing.
+	if s.replay != nil && (meta.Sequence.Stream == s.replay.last || meta.NumPending == 0) {
+		replies = append(replies, s.caughtUp())
+	}
+
+	return s.write(ctx, replies...)
+}
+
+func (s *session) matches(data []byte) bool {
 	event := sessionJSON[struct {
 		Provider, Event, Repository string
 		Payload                     json.RawMessage
-	}](message.Data())
+	}](data)
 
 	fields := filter.Extract(event.Event, event.Payload)
 	for _, sub := range s.subscriptions {
 		if sub.Matches(event.Provider, event.Event, event.Repository, fields) {
-			meta, err := message.Metadata()
-			if err != nil {
-				return err //nolint:wrapcheck // The run loop converts delivery errors into the protocol close status.
-			}
+			return true
+		}
+	}
 
-			return s.write(ctx, sequenceEnvelope(meta.Sequence.Stream, message.Data()))
+	return false
+}
+
+func (s *session) finishHello(ctx context.Context, reply sessionReply) error {
+	replies := []any{reply}
+
+	if s.replay != nil {
+		if s.replay.gap != nil {
+			replies = append(replies, s.replay.gap)
+		}
+
+		if !s.replay.pending {
+			replies = append(replies, s.caughtUp())
+		}
+	}
+
+	return s.write(ctx, replies...)
+}
+
+func (s *session) caughtUp() sessionReply {
+	last := s.replay.last
+	s.replay = nil
+
+	return sessionReply{typeKey: "caught_up", "seq": last}
+}
+
+//nolint:wrapcheck // The run loop converts write errors into the protocol close status.
+func (s *session) write(ctx context.Context, replies ...any) error {
+	ctx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+
+	for _, reply := range replies {
+		//nolint:errcheck,errchkjson // Replies and stored envelopes contain only JSON values.
+		data, _ := json.Marshal(reply)
+
+		err := s.conn.Write(ctx, websocket.MessageText, data)
+		if err != nil {
+			return err
 		}
 	}
 
 	return nil
-}
-
-//nolint:wrapcheck // The run loop converts write errors into the protocol close status.
-func (s *session) write(ctx context.Context, reply any) error {
-	ctx, cancel := context.WithTimeout(ctx, time.Second)
-	defer cancel()
-	//nolint:errcheck,errchkjson // Replies and stored envelopes contain only JSON values.
-	data, _ := json.Marshal(reply)
-
-	return s.conn.Write(ctx, websocket.MessageText, data)
 }

@@ -6,8 +6,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -84,10 +86,12 @@ func exerciseSession(t *testing.T, read readAPI, hook *githubWebhook, consumer j
 
 	read.store.jet.Conn().Close()
 
-	peer := session{stream: read.store.stream, conn: nil, events: nil, subscriptions: nil}
-	reply := peer.hello(ctx, nil)
-	checkEqual(t, reply["message"], "stream unavailable")
-	checkEqual(t, reply[codeKey], "internal")
+	peer := session{stream: read.store.stream, conn: nil, events: nil, subscriptions: nil, replay: nil}
+	for _, object := range []sessionObject{nil, {resumeKey: json.RawMessage("0")}} {
+		reply := peer.hello(ctx, object)
+		checkEqual(t, reply["message"], "stream unavailable")
+		checkEqual(t, reply[codeKey], "internal")
+	}
 
 	read.store.stream = readFetchStream{Stream: read.store.stream, consumer: consumer}
 	failed := httptest.NewServer(http.HandlerFunc(newSessionAPI(read, helloTimeout).connect))
@@ -97,6 +101,8 @@ func exerciseSession(t *testing.T, read readAPI, hook *githubWebhook, consumer j
 	socket = dialSession(ctx, t, failed.URL)
 	checkSessionReply(ctx, t, socket, `{"type":"hello"}`, typeKey, helloKind)
 	checkClose(ctx, t, socket, websocket.StatusInternalError, "delivery failed")
+	peer.conn = socket
+	checkEqual(t, peer.write(ctx, sessionReply{typeKey: pong}) != nil, true)
 }
 
 func checkSessionFrameLimit(ctx context.Context, t *testing.T, conn *websocket.Conn, url string) {
@@ -124,8 +130,9 @@ func checkSessionCommands(ctx context.Context, t *testing.T, conn *websocket.Con
 		{"{\"type\":\"ping\"}\n", typeKey, pong, ""},
 		{`[]`, codeKey, badFrame, ""},
 		{`{"type":"hello","subscriptions":[{"provider":"github"}]}`, codeKey, "bad_subscription", ""},
-		{`{"type":"hello","resume_after":0}`, "message", unsupported, ""},
+		{`{"type":"hello","resume_after":0}`, codeKey, badFrame, ""},
 		{`{"type":"hello","import":{}}`, "message", unsupported, ""},
+		{`{"type":"hello","resume_after":0,"import":true}`, codeKey, badFrame, ""},
 		{`{"type":"hello","more":3,"id":"` + maxID + `x"}`, codeKey, badFrame, ""},
 		{`{"type":"hello","subscriptions":{}}`, codeKey, badFrame, ""},
 		{`{"type":"hello","subscriptions":[` + strings.Repeat(`{},`, subscriptionLimit-1) + `{}]}`, codeKey, "limit", ""},
@@ -133,7 +140,7 @@ func checkSessionCommands(ctx context.Context, t *testing.T, conn *websocket.Con
 		checkEqual(t, string(checkSessionReply(ctx, t, conn, trial.send, trial.key, trial.want)["id"]), trial.id)
 	}
 
-	limit := session{stream: nil, conn: nil, events: make(chan jetstream.Msg), subscriptions: nil}
+	limit := session{stream: nil, conn: nil, events: make(chan jetstream.Msg), subscriptions: nil, replay: nil}
 	subs := `[` + strings.Repeat(pushSubscription+",", subscriptionLimit-1) + pushSubscription + `]`
 	reply := limit.hello(ctx, sessionObject{"more": json.RawMessage("true"), subsKey: json.RawMessage(subs)})
 	checkEqual(t, reply == nil, true)
@@ -155,7 +162,7 @@ func TestSessionDeliveryErrors(t *testing.T) {
 	sub, err := filter.Parse([]byte(pushSubscription))
 	checkError(t, err)
 
-	peer := session{stream: nil, conn: nil, events: nil, subscriptions: []filter.Subscription{sub}}
+	peer := session{stream: nil, conn: nil, events: nil, subscriptions: []filter.Subscription{sub}, replay: nil}
 	checkEqual[error](t, peer.deliver(t.Context(), invalidSessionMessage{Msg: nil}), jetstream.ErrNotJSMessage)
 }
 
@@ -165,6 +172,173 @@ func (invalidSessionMessage) Data() []byte { return []byte(pushSubscription) }
 
 func (invalidSessionMessage) Metadata() (*jetstream.MsgMetadata, error) {
 	return nil, jetstream.ErrNotJSMessage
+}
+
+func sessionReplayServer(t *testing.T, store eventStore) *httptest.Server {
+	t.Helper()
+
+	var tokens readTokens
+
+	tokens.path = filepath.Join(t.TempDir(), "tokens")
+	writeReadTokens(t, tokens.path, "reader", readFixture)
+	checkError(t, tokens.load())
+
+	read := readAPI{tokens: &tokens, store: store, telemetry: newTelemetry(slog.DiscardHandler, nil, nil)}
+	server := httptest.NewServer(http.HandlerFunc(newSessionAPI(read, helloTimeout).connect))
+	t.Cleanup(server.Close)
+
+	return server
+}
+
+func publishSessionEvent(t *testing.T, hook *githubWebhook, event, delivery string) {
+	t.Helper()
+
+	const body = `{"repository":{"full_name":"example/repo"}}`
+
+	expectStatus(t, hook.ServeHTTP, signedRequest(t.Context(), event, delivery, body), http.StatusAccepted)
+}
+
+func TestSessionResume(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(t.Context(), shutdownTimeout)
+	defer cancel()
+
+	store := testStore(t, retention)
+	hook := testWebhook(t, store, defaultBodyCap)
+	server := sessionReplayServer(t, store)
+
+	for _, delivery := range []string{"expired", "saved", "first", "second"} {
+		publishSessionEvent(t, hook, pushEvent, delivery)
+	}
+
+	publishSessionEvent(t, hook, issuesEvent, "filtered")
+
+	const (
+		start = `{"type":"hello","resume_after":2,"more":true}`
+		final = `{"type":"hello","subscriptions":[` + pushSubscription + `]}`
+		ping  = `{"type":"ping"}`
+	)
+
+	conn := dialSession(ctx, t, server.URL)
+	for _, invalid := range []string{`-1`, `"2"`, `1.5`, `1e2`, `null`, `18446744073709551616`} {
+		checkSessionReply(ctx, t, conn, `{"type":"hello","resume_after":`+invalid+`}`, codeKey, badFrame)
+	}
+
+	checkError(t, conn.Write(ctx, websocket.MessageText, []byte(start)))
+	checkSessionReply(ctx, t, conn, ping, typeKey, pong)
+	publishSessionEvent(t, hook, pushEvent, "live")
+
+	checkSessionReply(ctx, t, conn, final, subsKey, "1")
+	checkSessionReply(ctx, t, conn, "", "seq", "3")
+	checkSessionReply(ctx, t, conn, "", "seq", "4")
+	checkCaughtUp(ctx, t, conn, "5")
+	checkSessionReply(ctx, t, conn, "", "seq", "6")
+	checkSessionReply(ctx, t, conn, ping, typeKey, pong)
+
+	checkError(t, store.stream.DeleteMsg(ctx, 1))
+	checkError(t, store.stream.DeleteMsg(ctx, 2))
+
+	gapped := dialSession(ctx, t, server.URL)
+	checkSessionReply(ctx, t, gapped,
+		`{"type":"hello","resume_after":0,"subscriptions":[`+pushSubscription+`]}`, typeKey, helloKind)
+	gap := checkSessionReply(ctx, t, gapped, "", typeKey, "gap")
+	checkEqual(t, string(gap["from"]), "1")
+	checkEqual(t, string(gap["to"]), "2")
+
+	for _, seq := range []string{"3", "4", "6"} {
+		checkSessionReply(ctx, t, gapped, "", "seq", seq)
+	}
+
+	checkCaughtUp(ctx, t, gapped, "6")
+	checkSessionReply(ctx, t, gapped, ping, typeKey, pong)
+}
+
+func checkCaughtUp(ctx context.Context, t *testing.T, conn *websocket.Conn, seq string) {
+	t.Helper()
+
+	reply := checkSessionReply(ctx, t, conn, "", typeKey, "caught_up")
+	checkEqual(t, string(reply["seq"]), seq)
+}
+
+func TestSessionResumeWithoutBacklog(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(t.Context(), shutdownTimeout)
+	defer cancel()
+
+	store := testStore(t, retention)
+	hook := testWebhook(t, store, defaultBodyCap)
+	server := sessionReplayServer(t, store)
+
+	for _, trial := range []struct{ resume, last, live string }{
+		{"0", "0", "1"}, {"1", "1", "2"}, {"18446744073709551615", "2", ""},
+	} {
+		conn := dialSession(ctx, t, server.URL)
+		hello := `{"type":"hello","resume_after":` + trial.resume + `,"subscriptions":[` + pushSubscription + `]}`
+		checkSessionReply(ctx, t, conn, hello, typeKey, helloKind)
+		checkCaughtUp(ctx, t, conn, trial.last)
+		publishSessionEvent(t, hook, pushEvent, trial.resume)
+
+		if trial.live != "" {
+			checkSessionReply(ctx, t, conn, "", "seq", trial.live)
+		}
+
+		checkSessionReply(ctx, t, conn, `{"type":"ping"}`, typeKey, pong)
+	}
+}
+
+type sessionOpeningStream struct {
+	jetstream.Stream
+
+	publish func()
+}
+
+//nolint:ireturn // Match the JetStream stream interface.
+func (s sessionOpeningStream) OrderedConsumer(
+	ctx context.Context, config jetstream.OrderedConsumerConfig,
+) (jetstream.Consumer, error) {
+	s.publish()
+
+	return s.Stream.OrderedConsumer(ctx, config) //nolint:wrapcheck // Preserve the stream's result.
+}
+
+func TestSessionResumeMissingTail(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(t.Context(), shutdownTimeout)
+	defer cancel()
+
+	store := testStore(t, retention)
+	hook := testWebhook(t, store, defaultBodyCap)
+	publishSessionEvent(t, hook, pushEvent, "kept")
+	publishSessionEvent(t, hook, pushEvent, "removed")
+	checkError(t, store.stream.DeleteMsg(ctx, 2))
+
+	const hello = `{"type":"hello","resume_after":0,"subscriptions":[` + pushSubscription + `]}`
+
+	server := sessionReplayServer(t, store)
+	conn := dialSession(ctx, t, server.URL)
+	checkSessionReply(ctx, t, conn, hello, typeKey, helloKind)
+	checkSessionReply(ctx, t, conn, "", "seq", "1")
+	checkCaughtUp(ctx, t, conn, "2")
+
+	opening := store
+	opening.stream = sessionOpeningStream{Stream: store.stream, publish: func() {
+		publishSessionEvent(t, hook, pushEvent, "concurrent")
+	}}
+	server = sessionReplayServer(t, opening)
+	conn = dialSession(ctx, t, server.URL)
+	checkSessionReply(ctx, t, conn, hello, typeKey, helloKind)
+	checkSessionReply(ctx, t, conn, "", "seq", "1")
+	checkCaughtUp(ctx, t, conn, "2")
+	checkSessionReply(ctx, t, conn, "", "seq", "3")
+
+	checkError(t, store.stream.Purge(ctx))
+	server = sessionReplayServer(t, store)
+	conn = dialSession(ctx, t, server.URL)
+	checkSessionReply(ctx, t, conn, hello, typeKey, helloKind)
+	checkCaughtUp(ctx, t, conn, "3")
 }
 
 func checkSessionHandshakes(t *testing.T, api *sessionAPI) {
