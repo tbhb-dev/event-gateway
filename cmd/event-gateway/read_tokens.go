@@ -51,7 +51,7 @@ func (tokens *readTokens) load() error {
 		set[[sha256.Size]byte(hash)] = entry[1]
 	}
 
-	if len(set) == 0 {
+	if len(set) == 0 && tokens.set.Load() == nil {
 		return errTokenFormat
 	}
 
