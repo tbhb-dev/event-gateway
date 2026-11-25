@@ -11,6 +11,7 @@ allow:
   deepScan: false  # deep scanning runs the go command; the test has none
 
 components:
+  buildloop: {in: internal/buildloop}
   cmd: {in: cmd/*}
   deploy: {in: deploy}
   eventfields: {in: internal/eventfields}
@@ -41,6 +42,8 @@ vendors:
 deps:
   deploy:
     mayDependOn: [deploy]  # no imports from the module; go-arch-lint rejects an empty list
+  buildloop:
+    mayDependOn: [buildloop]
   cmd:
     mayDependOn: [cmd, eventfields, filter, routing, temporaltarget]
     canUse: [mcp, nats, telemetry, websocket]
