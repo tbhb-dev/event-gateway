@@ -21,12 +21,7 @@ func TestHealthcheck(t *testing.T) {
 	t.Cleanup(healthy.Close)
 
 	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusServiceUnavailable)
-
-		_, writeErr := w.Write([]byte("secret-body"))
-		if writeErr != nil {
-			t.Error(writeErr)
-		}
+		http.Error(w, "secret-body", http.StatusServiceUnavailable)
 	}))
 	t.Cleanup(bad.Close)
 
@@ -61,6 +56,8 @@ func TestHealthcheck(t *testing.T) {
 		{"whitespace", []string{"-addr=127.0.0.1 :80"}, true},
 		{"refused", []string{"-addr=" + closed}, true},
 		{"bad address", []string{"-addr=bad host"}, true},
+		{"empty host", []string{"-addr=:8080"}, true},
+		{"help", []string{"-help"}, true},
 		{"unknown flag", []string{"-nope"}, true},
 		{"extra args", []string{"-addr=" + okAddr, "extra"}, true},
 	} {

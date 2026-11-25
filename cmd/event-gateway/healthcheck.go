@@ -77,10 +77,10 @@ func healthcheck(ctx context.Context, args []string) error {
 	return nil
 }
 
-// validateHealthcheckAddr requires a bare HOST:PORT without echoing the value.
+// validateHealthcheckAddr requires HOST:PORT with a non-empty host without echoing the value.
 func validateHealthcheckAddr(addr string) error {
 	host, port, err := net.SplitHostPort(addr)
-	if err != nil || strings.ContainsAny(host, healthcheckBadHost) {
+	if err != nil || host == "" || strings.ContainsAny(host, healthcheckBadHost) {
 		return errHealthcheckUsage
 	}
 
