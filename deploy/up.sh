@@ -66,7 +66,7 @@ bind=${EVENT_GATEWAY_SESSION_BIND:-}
 octet='(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])'
 
 case $bind in
-'' | 0.0.0.0 | *[[:space:]]*)
+'' | 0.* | *[[:space:]]*)
   echo "up.sh: EVENT_GATEWAY_SESSION_BIND must be a non-zero IPv4 address" >&2
   exit 2
   ;;
@@ -80,8 +80,8 @@ fi
 for name in github_webhook_secret event_gateway_session_tokens tunnel_token; do
   file=$deploy_dir/secrets/$name
   # find prints the path only when the file matches; a missing file prints nothing.
-  found=$(find "$file" -type f -perm 0400 -user 65532 2>/dev/null || true)
-  if [ -L "$file" ] || [ -z "$found" ]; then
+  if [ -L "$file" ] || [ ! -f "$file" ] ||
+    [ -z "$(find "$file" -type f -perm 0400 -user 65532 2>/dev/null || true)" ]; then
     echo "up.sh: secrets/$name must be a regular file, not a symlink, with mode 400 and owner uid 65532" >&2
     exit 2
   fi

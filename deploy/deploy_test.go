@@ -27,6 +27,7 @@ const (
 	token         = "tunnel_token"
 	bindAddr      = "100.64.0.1"
 	bindEnv       = "EVENT_GATEWAY_SESSION_BIND=" + bindAddr
+	secretUID     = 65532
 )
 
 // result is what one run of up.sh left behind.
@@ -76,7 +77,7 @@ func fixture(t *testing.T) string {
 			"printf '%s\\0' \"${EVENT_GATEWAY_IMAGE:-}\" \"${EVENT_GATEWAY_SESSION_BIND:-}\" \"$@\" > record\n",
 		0o700,
 	)
-	write("sudo", "#!/bin/sh\nexec \"$@\"\n", 0o700)
+	write("sudo", "#!/bin/sh\nexec env -i PATH=\"$PATH\" \"$@\"\n", 0o700)
 	write("find", "#!/bin/sh\nexec "+realFind+" \"$1\" -type f -perm 0400\n", 0o700)
 
 	for _, tool := range []string{"grep", "dirname", "env"} {
@@ -208,6 +209,11 @@ func TestUpRequiresSecrets(t *testing.T) {
 				must(t, os.Remove(path(dir)))
 				must(t, os.Symlink(filepath.Join(dir, "up.sh"), path(dir)))
 			},
+			"directory": func(dir string) {
+				must(t, os.Remove(path(dir)))
+				must(t, os.Mkdir(path(dir), 0o700))
+				must(t, os.WriteFile(filepath.Join(path(dir), "child"), nil, 0o400))
+			},
 			"missing": func(dir string) { must(t, os.Remove(path(dir))) },
 		} {
 			t.Run(name+" "+kind, func(t *testing.T) {
@@ -227,6 +233,7 @@ func TestUpRequiresSessionBind(t *testing.T) {
 	for name, bind := range map[string]string{
 		"empty":          "",
 		"all interfaces": "0.0.0.0",
+		"zero network":   "0.1.2.3",
 		"ipv6":           "::",
 		"bracketed ipv6": "[::]",
 		"hostname":       "localhost",
@@ -248,6 +255,10 @@ func TestUpRequiresSessionBind(t *testing.T) {
 // TestUpRequiresOwner swaps in the real find, which sees another owner.
 func TestUpRequiresOwner(t *testing.T) {
 	t.Parallel()
+
+	if os.Getuid() == secretUID {
+		t.Skip("fixture files already belong to uid 65532")
+	}
 
 	checkRefused(t, func(dir string) {
 		realFind, err := exec.LookPath("find")
@@ -320,8 +331,7 @@ func TestComposeSettings(t *testing.T) {
 				"      - -store-dir\n      - /data/nats\n",
 			"\n    ports:\n      # yamllint disable-line rule:line-length\n      - \"" +
 				"${EVENT_GATEWAY_SESSION_BIND:?set the host address for the session port, for example a tailnet address}" +
-				":8081:8081\"\n",
-			"\n    volumes:\n      - data:/data\n",
+				":8081:8081\"\n    volumes:\n      - data:/data\n",
 			"\n    secrets:\n      - source: github_webhook_secret\n        uid: \"65532\"\n" +
 				"        gid: \"65532\"\n        mode: 0400\n      - source: event_gateway_session_tokens\n" +
 				"        uid: \"65532\"\n        gid: \"65532\"\n        mode: 0400\n",
@@ -358,6 +368,7 @@ func TestComposeSettings(t *testing.T) {
 	}
 
 	if strings.Count(whole, "event_gateway_session_tokens:") != 1 ||
+		strings.Count(whole, "ports:") != 1 ||
 		strings.Contains(tunnel, sessionTokens) || strings.Contains(tunnel, "ports:") {
 		t.Error("session tokens or ports leaked outside gateway")
 	}
