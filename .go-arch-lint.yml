@@ -19,6 +19,8 @@ components:
   temporaltarget: {in: internal/temporaltarget}
 
 vendors:
+  temporal:
+    in: [go.temporal.io/api/**, go.temporal.io/sdk/**]
   websocket:
     in: [github.com/coder/websocket, github.com/coder/websocket/**]
   nats:
@@ -47,3 +49,4 @@ deps:
     mayDependOn: [routing, filter]
   temporaltarget:
     mayDependOn: [temporaltarget, eventfields, routing]
+    canUse: [temporal]
