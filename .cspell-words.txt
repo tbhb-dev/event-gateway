@@ -15,6 +15,7 @@ blrp
 bodyclose
 buildcop
 buildifier
+buildloop
 buildmeta
 buildtag
 buildx

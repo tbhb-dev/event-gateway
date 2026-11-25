@@ -86,6 +86,7 @@ GO_TARGETS = [
     "//cmd/event-gateway",
     "//cmd/event-gateway:event-gateway_test",
     "//deploy:deploy_test",
+    "//internal/buildloop:buildloop_test",
     "//internal/eventfields:eventfields_test",
     "//internal/filter:filter_test",
     "//internal/redelivery:redelivery_test",
@@ -133,6 +134,14 @@ gobco_test(
     go_sum = "go.sum",
     proxy = "@go_mod_proxy//:proxy",
     tests = ["//cmd/event-gateway:event-gateway_test"],
+)
+
+gobco_test(
+    name = "buildloop_gobco_test",
+    go_mod = "go.mod",
+    go_sum = "go.sum",
+    proxy = "@go_mod_proxy//:proxy",
+    tests = ["//internal/buildloop:buildloop_test"],
 )
 
 gobco_test(
