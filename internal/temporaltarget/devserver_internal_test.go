@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -121,14 +122,34 @@ func startDevServer(t *testing.T) (*SDKClient, func()) {
 		close(exited)
 	}()
 
-	stop := func() {
-		killErr := cmd.Process.Kill()
-		if killErr != nil && !errors.Is(killErr, os.ErrProcessDone) {
-			t.Errorf("stop Temporal dev server: %v", killErr)
+	stopServer := sync.OnceValue(func() error {
+		var exitErr, killErr error
+
+		select {
+		case exitErr = <-exited:
+		default:
+			killErr = cmd.Process.Kill()
+
+			const stopTimeout = 5 * time.Second
+
+			// Wait can reap the process between the exit check and Kill.
+			select {
+			case exitErr = <-exited:
+			case <-time.After(stopTimeout):
+				return fmt.Errorf("Temporal dev server did not exit within %s: %w",
+					stopTimeout, errors.Join(context.DeadlineExceeded, killErr))
+			}
 		}
 
-		//nolint:errcheck // A killed server is expected to exit with an error.
-		<-exited
+		if exitErr != nil && cmd.ProcessState == nil {
+			return fmt.Errorf("wait for Temporal dev server: %w", errors.Join(exitErr, killErr))
+		}
+
+		return nil
+	})
+	stop := func() {
+		t.Helper()
+		devCheck(t, stopServer())
 	}
 	t.Cleanup(stop)
 
