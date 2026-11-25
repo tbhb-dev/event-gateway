@@ -108,7 +108,8 @@ func fixedPath(name string) bool {
 // Run runs one command and waits for it. A command that exits with a nonzero
 // status is not an error: the status is in Result.ExitCode. Run returns a
 // *NotAllowedError, *TimeoutError, or *OutputCapError for those failures, and
-// the Result of the last two holds the output captured so far.
+// the Result of the last two holds the output captured so far. A command that
+// fails and also goes past the cap returns both errors joined.
 func (r *Runner) Run(ctx context.Context, command Command) (Result, error) {
 	if _, ok := r.allowed[command.Executable]; !ok {
 		return Result{}, &NotAllowedError{Executable: command.Executable}
@@ -137,20 +138,27 @@ func (r *Runner) Run(ctx context.Context, command Command) (Result, error) {
 		Truncated: out.truncated,
 	}
 
-	var exitErr *exec.ExitError
+	var (
+		exitErr *exec.ExitError
+		runErr  error
+	)
 
 	switch {
 	case err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded):
-		return result, &TimeoutError{Timeout: timeout}
+		runErr = &TimeoutError{Timeout: timeout}
 	case err != nil && ctx.Err() != nil:
-		return result, fmt.Errorf("run %q: %w", command.Executable, ctx.Err())
+		runErr = fmt.Errorf("run %q: %w", command.Executable, ctx.Err())
 	case err != nil && !errors.As(err, &exitErr):
-		return result, fmt.Errorf("run %q: %w", command.Executable, err)
-	case out.truncated:
-		return result, &OutputCapError{Limit: OutputLimit}
-	default:
-		return result, nil
+		runErr = fmt.Errorf("run %q: %w", command.Executable, err)
 	}
+
+	// The cap error joins any other failure, so a command that floods and then
+	// times out reports both.
+	if out.truncated {
+		runErr = errors.Join(runErr, &OutputCapError{Limit: OutputLimit})
+	}
+
+	return result, runErr
 }
 
 // capture keeps the first OutputLimit bytes written to it and discards the

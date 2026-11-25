@@ -17,13 +17,14 @@ import (
 )
 
 const (
-	helperArg   = "buildloop-helper"
-	modeExit    = "exit"
-	modeFlood   = "flood"
-	modeSleep   = "sleep"
-	modeWD      = "wd"
-	missingBase = "buildloop-missing-executable"
-	bothStreams = "to stdout\nto stderr\n"
+	helperArg      = "buildloop-helper"
+	modeExit       = "exit"
+	modeFlood      = "flood"
+	modeFloodSleep = "flood-then-sleep"
+	modeSleep      = "sleep"
+	modeWD         = "wd"
+	missingBase    = "buildloop-missing-executable"
+	bothStreams    = "to stdout\nto stderr\n"
 )
 
 // TestMain turns the test binary into the command the tests run.
@@ -44,6 +45,10 @@ func helper(mode string, args []string) int {
 		return number(args)
 	case modeFlood:
 		_, _ = os.Stdout.WriteString(strings.Repeat("x", number(args)))
+	case modeFloodSleep:
+		_, _ = os.Stdout.WriteString(strings.Repeat("x", number(args)))
+
+		time.Sleep(time.Minute)
 	case modeSleep:
 		time.Sleep(time.Minute)
 	case modeWD:
@@ -188,6 +193,14 @@ func isNotAllowed(err error) bool {
 	return errors.As(err, &target) && target.Error() != ""
 }
 
+func isTimeoutAndCap(err error) bool {
+	var timedOut *buildloop.TimeoutError
+
+	var capped *buildloop.OutputCapError
+
+	return errors.As(err, &timedOut) && errors.As(err, &capped)
+}
+
 func TestNewRunnerRejectsUnfixedPaths(t *testing.T) {
 	t.Parallel()
 
@@ -244,6 +257,12 @@ func TestRunErrors(t *testing.T) {
 
 				return errors.As(err, &target) && target.Limit == buildloop.OutputLimit && target.Error() != ""
 			},
+			wantOutput: buildloop.OutputLimit,
+		},
+		{
+			name:       "output cap and timeout",
+			command:    helperCommand(t, 2*time.Second, modeFloodSleep, strconv.Itoa(buildloop.OutputLimit+10)),
+			check:      isTimeoutAndCap,
 			wantOutput: buildloop.OutputLimit,
 		},
 		{
