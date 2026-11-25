@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright Tony Burns
+# cspell:words eventfields temporaltarget
+
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+load("@tbhb_rules//repo:defs.bzl", "repo_files")
+load("@tbhb_rules_go//:defs.bzl", "gobco_test")
+
+repo_files()
+
+gobco_test(
+    name = "temporaltarget_gobco_test",
+    go_mod = "//:go.mod",
+    go_sum = "//:go.sum",
+    proxy = "@go_mod_proxy//:proxy",
+    tests = [":temporaltarget_test"],
+)
+
+go_library(
+    name = "temporaltarget",
+    srcs = ["target.go"],
+    importpath = "go.tbhb.dev/event-gateway/internal/temporaltarget",
+    visibility = ["//:__subpackages__"],
+    deps = [
+        "//internal/eventfields",
+        "//internal/routing",
+    ],
+)
+
+go_test(
+    name = "temporaltarget_test",
+    srcs = ["target_internal_test.go"],
+    embed = [":temporaltarget"],
+    deps = [
+        "//internal/eventfields",
+        "//internal/routing",
+    ],
+)
