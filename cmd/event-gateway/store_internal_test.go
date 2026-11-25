@@ -50,7 +50,7 @@ func TestStoreDeliveryDuplicates(t *testing.T) {
 		projected:  nil,
 	}
 	checkError(t, store.publish(ctx, message))
-	checkError(t, store.publish(ctx, message))
+	checkEqual(t, errors.Is(store.publish(ctx, message), errDuplicate), true)
 
 	changed := message
 	changed.Payload = []byte(body + " ")

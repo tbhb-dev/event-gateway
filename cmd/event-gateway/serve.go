@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -244,15 +245,16 @@ func (cfg *serveConfig) start(
 	webhook := gatewayHTTP(cfg.listen, withGrafana(grafana, handler, store, signals))
 
 	return runWithTargets(ctx, store, signals, targets, func(ctx context.Context) error {
-		return cfg.runHTTP(ctx, tokens, store, signals, append(parked(store), webhook))
+		return cfg.runHTTP(ctx, tokens, store, signals, targets, append(parked(store), webhook))
 	})
 }
 
 func (cfg *serveConfig) runHTTP(
-	ctx context.Context, tokens *readTokens, store eventStore, signals telemetry, servers []httpService,
+	ctx context.Context, tokens *readTokens, store eventStore, signals telemetry, targets []runnerTarget,
+	servers []httpService,
 ) error {
 	if cfg.readListen == "" {
-		return runHTTP(ctx, nil, signals.logger, servers...)
+		return cfg.serveHTTP(ctx, nil, signals.logger, targets, servers...)
 	}
 
 	api := readAPI{tokens: tokens, store: store, telemetry: signals}
@@ -265,16 +267,16 @@ func (cfg *serveConfig) runHTTP(
 
 		defer sessions.active.Wait()
 
-		return runHTTP(ctx, tokens, signals.logger, append(servers, reader, server)...)
+		return cfg.serveHTTP(ctx, tokens, signals.logger, targets, append(servers, reader, server)...)
 	}
 
-	return runHTTP(ctx, tokens, signals.logger, append(servers, reader)...)
+	return cfg.serveHTTP(ctx, tokens, signals.logger, targets, append(servers, reader)...)
 }
 
 type httpService struct {
 	*http.Server
 
-	serve func() error
+	listen func(context.Context) (net.Listener, error)
 }
 
 type parkedService func(eventStore) []httpService
@@ -292,10 +294,17 @@ func gatewayHTTP(address string, handler http.Handler) httpService {
 		WriteTimeout:                 writeTimeout,
 	}
 
-	return httpService{Server: server, serve: server.ListenAndServe}
+	return httpService{
+		Server: server,
+		listen: func(ctx context.Context) (net.Listener, error) {
+			return new(net.ListenConfig).Listen(ctx, "tcp", address)
+		},
+	}
 }
 
-func runHTTP(ctx context.Context, tokens *readTokens, logger *slog.Logger, servers ...httpService) error {
+func (cfg *serveConfig) serveHTTP(
+	ctx context.Context, tokens *readTokens, logger *slog.Logger, targets []runnerTarget, servers ...httpService,
+) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -308,10 +317,36 @@ func runHTTP(ctx context.Context, tokens *readTokens, logger *slog.Logger, serve
 		tick = ticker.C
 	}
 
-	stopped := make(chan error, len(servers))
+	listeners := make([]net.Listener, 0, len(servers))
 	for _, server := range servers {
+		listener, err := server.listen(ctx)
+		if err != nil {
+			for _, opened := range listeners {
+				_ = opened.Close()
+			}
+
+			return fmt.Errorf("serve HTTP: %w", err)
+		}
+
+		listeners = append(listeners, listener)
+	}
+
+	rules := 0
+	for _, target := range targets {
+		rules += target.Rules
+	}
+
+	logger.InfoContext(
+		ctx, "event gateway started",
+		"version", version, "listen", cfg.listen,
+		"session_listen", cfg.wsListen, "read_listen", cfg.readListen,
+		"store_dir", cfg.storeDir, "targets", len(targets), "rules", rules,
+	)
+
+	stopped := make(chan error, len(servers))
+	for index, server := range servers {
 		go func() {
-			stopped <- runHTTPServer(ctx, server)
+			stopped <- runHTTPServer(ctx, server.Server, listeners[index])
 
 			cancel()
 		}()
@@ -332,7 +367,7 @@ func runHTTP(ctx context.Context, tokens *readTokens, logger *slog.Logger, serve
 	return err
 }
 
-func runHTTPServer(ctx context.Context, httpServer httpService) error {
+func runHTTPServer(ctx context.Context, httpServer *http.Server, listener net.Listener) error {
 	done := make(chan error, 1)
 	stop := context.AfterFunc(ctx, func() {
 		shutdown, cancel := context.WithTimeout(context.WithoutCancel(ctx), shutdownTimeout)
@@ -341,10 +376,10 @@ func runHTTPServer(ctx context.Context, httpServer httpService) error {
 		done <- errors.Join(httpServer.Shutdown(shutdown), httpServer.Close())
 	})
 
-	err := httpServer.serve()
-	if stop() {
-		return fmt.Errorf("serve HTTP: %w", err)
-	}
+	defer stop()
+
+	//nolint:errcheck // Shutdown closes the listener and reports errors through done.
+	_ = httpServer.Serve(listener)
 
 	return <-done
 }

@@ -159,7 +159,7 @@ func loadTargets(path string, registry map[string]targetFactory) ([]runnerTarget
 
 		targets = append(targets, runnerTarget{
 			Target: ruleTarget{actor: actions, config: target},
-			Start:  start, Subjects: target.Subjects(),
+			Start:  start, Subjects: target.Subjects(), Rules: len(target.Rules),
 		})
 	}
 

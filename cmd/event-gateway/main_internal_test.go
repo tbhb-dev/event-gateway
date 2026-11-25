@@ -3,9 +3,12 @@
 
 package main
 
+// cspell:words temporaltarget
+
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -18,6 +21,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"go.tbhb.dev/event-gateway/internal/temporaltarget"
 )
 
 const (
@@ -167,13 +172,18 @@ func TestServeValidSecretAndContextShutdown(t *testing.T) {
 	t.Setenv(grafanaEnv, "")
 	checkError(t, os.Unsetenv(grafanaEnv))
 
-	file := filepath.Join(t.TempDir(), "secret")
+	file := filepath.Join(t.TempDir(), "secret-file-fixture")
 	checkError(t, os.WriteFile(file, []byte(fixtureKey+"\r\n"), 0o600))
+
+	useTemporalDial(t, func(temporaltarget.Connection) (temporalClient, error) {
+		return new(fakeTemporalClient), nil
+	})
 
 	exerciseServe(t, file, http.StatusNotFound)
 	checkEqual(t, exports.Load(), 0)
 
 	exerciseServe(t, file, http.StatusUnauthorized, "-grafana-secret-file="+file,
+		"-targets="+writeTargets(t, temporalTargets), "-parked-socket="+filepath.Join(shortSocketDir(t), "s"),
 		"-otlp-endpoint="+collector.URL, "-otlp-header=X-Collector-Test=test=value", "-session-listen=127.0.0.1:0")
 	checkEqual(t, exports.Load() > 0, true)
 	checkEqual(t, sentHeader.Load(), true)
@@ -194,7 +204,7 @@ func exerciseServe(t *testing.T, file string, grafanaStatus int, flags ...string
 	checkError(t, listener.Close())
 
 	dir := t.TempDir()
-	tokens := filepath.Join(dir, "tokens")
+	tokens := filepath.Join(dir, "tokens-file-fixture")
 	writeReadTokens(t, tokens, "reader", readFixture)
 
 	args := append(
@@ -259,8 +269,51 @@ func exerciseServe(t *testing.T, file string, grafanaStatus int, flags ...string
 		t.Fatal("gateway did not shut down after context cancellation")
 	}
 
-	checkEqual(t, strings.Contains(logs.String(), fixtureKey), false)
-	checkEqual(t, strings.Contains(logs.String(), "private test payload"), false)
+	output := logs.String()
+	for _, forbidden := range []string{
+		fixtureKey, readFixture, file, tokens, "secret-file-fixture", "tokens-file-fixture", "private test payload",
+	} {
+		checkEqual(t, strings.Contains(output, forbidden), false)
+	}
+
+	checkStartupLog(t, output, address, dir, len(flags) > 0)
+}
+
+func checkStartupLog(t *testing.T, output, listen, storeDir string, withExtras bool) {
+	t.Helper()
+
+	line, _, _ := strings.Cut(output, "\n")
+
+	//nolint:tagliatelle // Matches the slog JSON record keys.
+	var started struct {
+		Level         string `json:"level"`
+		Msg           string `json:"msg"`
+		Version       string `json:"version"`
+		Listen        string `json:"listen"`
+		SessionListen string `json:"session_listen"`
+		ReadListen    string `json:"read_listen"`
+		StoreDir      string `json:"store_dir"`
+		Targets       int    `json:"targets"`
+		Rules         int    `json:"rules"`
+	}
+
+	checkError(t, json.Unmarshal([]byte(line), &started))
+	checkEqual(t, started.Level, "INFO")
+	checkEqual(t, started.Msg, "event gateway started")
+	checkEqual(t, started.Version, version)
+	checkEqual(t, started.Listen, listen)
+	checkEqual(t, started.ReadListen, "127.0.0.1:0")
+	checkEqual(t, started.StoreDir, storeDir)
+
+	if withExtras {
+		checkEqual(t, started.SessionListen, "127.0.0.1:0")
+		checkEqual(t, started.Targets, 1)
+		checkEqual(t, started.Rules, 1)
+	} else {
+		checkEqual(t, started.SessionListen, "")
+		checkEqual(t, started.Targets, 0)
+		checkEqual(t, started.Rules, 0)
+	}
 }
 
 func expectHTTPStatus(t *testing.T, client *http.Client, req *http.Request, status int) {
