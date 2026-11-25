@@ -18,8 +18,7 @@ import (
 	"go.tbhb.dev/event-gateway/internal/routing"
 )
 
-// The SDK adapter maps server errors to these sentinels. Which error the server
-// returns for each reuse policy still needs verification against a dev server.
+// The SDK adapter maps server errors to these sentinels.
 var (
 	ErrTransient      = errors.New("transient")
 	ErrAlreadyStarted = errors.New("already started")

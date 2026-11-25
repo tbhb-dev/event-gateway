@@ -44,6 +44,8 @@ func TestMapSDKError(t *testing.T) {
 		{serviceerror.NewResourceExhausted(0, hidden), ErrTransient},
 		{serviceerror.NewDeadlineExceeded(hidden), ErrTransient},
 		{serviceerror.NewCanceled(hidden), ErrTransient},
+		{serviceerror.NewAborted(hidden), ErrTransient},
+		{serviceerror.NewInternal(hidden), ErrTransient},
 		{context.DeadlineExceeded, ErrTransient},
 		{context.Canceled, ErrTransient},
 		{permanent, permanent},
