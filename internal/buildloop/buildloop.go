@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"time"
 )
 
@@ -22,8 +23,9 @@ const (
 	waitDelay      = 5 * time.Second
 )
 
-// Command describes one command to run. Executable is matched exactly against
-// the Runner's allow-list and is never run through a shell. A zero Timeout
+// Command describes one command to run. Executable must be an absolute, cleaned
+// path. It is matched exactly against the Runner's allow-list and is never run
+// through a shell or looked up on PATH. A zero Timeout
 // means ten minutes, and an empty Dir means the current directory.
 type Command struct {
 	Executable string
@@ -62,7 +64,8 @@ func (e *OutputCapError) Error() string {
 	return fmt.Sprintf("command output exceeded %d bytes", e.Limit)
 }
 
-// NotAllowedError reports an executable that is not on the allow-list.
+// NotAllowedError reports an executable that is not on the allow-list or is not
+// an absolute, cleaned path.
 type NotAllowedError struct {
 	Executable string
 }
@@ -77,16 +80,29 @@ type Runner struct {
 	allowed map[string]struct{}
 }
 
-// NewRunner returns a Runner that runs only the named executables. A name must
-// match Command.Executable exactly: the Runner does not clean paths, fold
-// case, or take the base name.
-func NewRunner(allowed ...string) *Runner {
+// NewRunner returns a Runner that runs only the named executables. Each name
+// must be an absolute, cleaned path, or NewRunner returns a *NotAllowedError:
+// a bare or relative name would be resolved through PATH or the working
+// directory and so could select a different binary. A name must match
+// Command.Executable exactly: the Runner does not clean paths, fold case, or
+// take the base name.
+func NewRunner(allowed ...string) (*Runner, error) {
 	set := make(map[string]struct{}, len(allowed))
+
 	for _, name := range allowed {
+		if !fixedPath(name) {
+			return nil, &NotAllowedError{Executable: name}
+		}
+
 		set[name] = struct{}{}
 	}
 
-	return &Runner{allowed: set}
+	return &Runner{allowed: set}, nil
+}
+
+// fixedPath reports whether name is an absolute path that is already cleaned.
+func fixedPath(name string) bool {
+	return filepath.IsAbs(name) && filepath.Clean(name) == name
 }
 
 // Run runs one command and waits for it. A command that exits with a nonzero

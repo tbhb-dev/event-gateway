@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -21,7 +22,7 @@ const (
 	modeFlood   = "flood"
 	modeSleep   = "sleep"
 	modeWD      = "wd"
-	missingName = "buildloop-missing-executable"
+	missingBase = "buildloop-missing-executable"
 	bothStreams = "to stdout\nto stderr\n"
 )
 
@@ -75,6 +76,27 @@ func self(t *testing.T) string {
 	}
 
 	return path
+}
+
+func uncleaned(t *testing.T) string {
+	t.Helper()
+
+	return filepath.Dir(self(t)) + "/./" + filepath.Base(self(t))
+}
+
+func missing() string {
+	return filepath.Join(os.TempDir(), missingBase)
+}
+
+func newRunner(t *testing.T, allowed ...string) *buildloop.Runner {
+	t.Helper()
+
+	runner, err := buildloop.NewRunner(allowed...)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return runner
 }
 
 func helperCommand(t *testing.T, timeout time.Duration, args ...string) buildloop.Command {
@@ -140,7 +162,7 @@ func TestRun(t *testing.T) {
 		},
 	}
 
-	runner := buildloop.NewRunner(self(t))
+	runner := newRunner(t, self(t))
 
 	for _, testCase := range tests {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -153,6 +175,40 @@ func TestRun(t *testing.T) {
 
 			if !testCase.check(got) || got.Duration <= 0 {
 				t.Errorf("Run() = exit %d, %d bytes, duration %s", got.ExitCode, len(got.Output), got.Duration)
+			}
+		})
+	}
+}
+
+func isNotAllowed(err error) bool {
+	var target *buildloop.NotAllowedError
+
+	return errors.As(err, &target) && target.Error() != ""
+}
+
+func TestNewRunnerRejectsUnfixedPaths(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		allowed string
+	}{
+		{name: "bare name", allowed: "sh"},
+		{name: "dot relative", allowed: "./tool"},
+		{name: "nested relative", allowed: "bin/tool"},
+		{name: "parent relative", allowed: "../tool"},
+		{name: "uncleaned absolute", allowed: "/usr/bin/../bin/tool"},
+		{name: "trailing slash", allowed: "/usr/bin/tool/"},
+		{name: "empty", allowed: ""},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			runner, err := buildloop.NewRunner(self(t), testCase.allowed)
+			if !isNotAllowed(err) || runner != nil {
+				t.Fatalf("NewRunner() = %v, %v, want a *NotAllowedError", runner, err)
 			}
 		})
 	}
@@ -189,28 +245,35 @@ func TestRunErrors(t *testing.T) {
 			wantOutput: buildloop.OutputLimit,
 		},
 		{
-			name:    "disallowed command",
-			command: buildloop.Command{Executable: "sh", Dir: "", Args: []string{"-c", "true"}, Timeout: 0},
-			check: func(err error) bool {
-				var target *buildloop.NotAllowedError
-
-				return errors.As(err, &target) && target.Executable == "sh" && target.Error() != ""
-			},
+			name:       "disallowed command",
+			command:    buildloop.Command{Executable: "sh", Dir: "", Args: []string{"-c", "true"}, Timeout: 0},
+			check:      isNotAllowed,
 			wantOutput: 0,
 		},
 		{
-			name:    "allowed name matches only exactly",
-			command: buildloop.Command{Executable: "./" + self(t), Dir: "", Args: nil, Timeout: 0},
-			check: func(err error) bool {
-				var target *buildloop.NotAllowedError
+			name:    "relative path of an allowed binary",
+			command: buildloop.Command{Executable: "./" + filepath.Base(self(t)), Dir: "", Args: nil, Timeout: 0},
+			check:   isNotAllowed,
 
-				return errors.As(err, &target)
-			},
+			wantOutput: 0,
+		},
+		{
+			name:    "bare name of an allowed binary",
+			command: buildloop.Command{Executable: filepath.Base(self(t)), Dir: "", Args: nil, Timeout: 0},
+			check:   isNotAllowed,
+
+			wantOutput: 0,
+		},
+		{
+			name:    "uncleaned path of an allowed binary",
+			command: buildloop.Command{Executable: uncleaned(t), Dir: "", Args: nil, Timeout: 0},
+			check:   isNotAllowed,
+
 			wantOutput: 0,
 		},
 		{
 			name:    "command that cannot start",
-			command: buildloop.Command{Executable: missingName, Dir: "", Args: nil, Timeout: 0},
+			command: buildloop.Command{Executable: missing(), Dir: "", Args: nil, Timeout: 0},
 			check: func(err error) bool {
 				var notAllowed *buildloop.NotAllowedError
 
@@ -220,7 +283,7 @@ func TestRunErrors(t *testing.T) {
 		},
 	}
 
-	runner := buildloop.NewRunner(self(t), missingName)
+	runner := newRunner(t, self(t), missing())
 
 	for _, testCase := range tests {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -249,7 +312,7 @@ func TestRunCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
-	_, err := buildloop.NewRunner(self(t)).Run(ctx, helperCommand(t, 0, modeSleep))
+	_, err := newRunner(t, self(t)).Run(ctx, helperCommand(t, 0, modeSleep))
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("Run() error = %v, want context.Canceled", err)
 	}
