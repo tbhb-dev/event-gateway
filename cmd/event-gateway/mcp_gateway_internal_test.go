@@ -14,6 +14,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
@@ -412,6 +414,14 @@ func checkMCPGatewayLifetime(t *testing.T, name string) {
 	_, peer, notifier := connectMCPClient(t, name, notifications)
 	logger := slog.New(slog.DiscardHandler)
 
+	t.Setenv(mcpStateHomeEnv, t.TempDir())
+	setMCPStateKeys(t, [3]string{mcpStateTestKey, "", ""})
+
+	subs := loadMCPSubscriptions(ctx, logger)
+	file := filepath.Join(subs.state.dir, subs.state.file)
+	checkError(t, os.MkdirAll(filepath.Dir(file), 0o700))
+	checkError(t, os.WriteFile(file, []byte(mcpStateDocument(mcpStateTestSubscription)), 0o600))
+
 	for _, test := range [][2]string{{"", ""}, {"ws://example.invalid", ""}, {"", mcpFixture}} {
 		t.Setenv(gatewayURLEnv, test[0])
 		t.Setenv(gatewayTokenEnv, test[1])
@@ -425,7 +435,7 @@ func checkMCPGatewayLifetime(t *testing.T, name string) {
 	server, requests := fakeMCPGateway(t, []int{http.StatusSwitchingProtocols}, func(conn *websocket.Conn) {
 		defer close(disconnected)
 
-		checkEqual(t, string(receiveGatewayHello(ctx, t, conn)[subsKey]) == "[]", true)
+		checkEqual(t, string(receiveGatewayHello(ctx, t, conn)[subsKey]), "["+mcpStateTestSubscription+"]")
 		checkEqual(t, conn.Write(ctx, websocket.MessageText, []byte(`{"type":"gap","from":3,"to":5}`)) == nil, true)
 
 		if name != claudeCodeClient {
@@ -445,7 +455,7 @@ func checkMCPGatewayLifetime(t *testing.T, name string) {
 	stop()
 	checkEqual(t, requests.Load(), 0)
 
-	initialized, stop := startMCPGateway(ctx, new(mcpSubscriptions).list, notifier, logger)
+	initialized, stop := startMCPGateway(ctx, loadMCPSubscriptions(ctx, logger).list, notifier, logger)
 	defer stop()
 
 	initialized(ctx, &mcp.InitializedRequest{Session: peer, Params: nil, Extra: nil})

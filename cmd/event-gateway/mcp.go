@@ -55,8 +55,8 @@ func runMCP(ctx context.Context, logHandler slog.Handler, args []string) error {
 	}
 
 	notifier := &notifyingTransport{inner: &mcp.StdioTransport{MaxLineLength: 0}, conn: nil, mu: sync.Mutex{}}
-	subs := new(mcpSubscriptions)
 	logger := slog.New(logHandler)
+	subs := loadMCPSubscriptions(ctx, logger)
 
 	initialized, stopGateway := startMCPGateway(ctx, subs.list, notifier, logger)
 	defer stopGateway()
@@ -279,8 +279,9 @@ func subscriptionSchema(required string) json.RawMessage {
 }
 
 type mcpSubscriptions struct {
-	subs []filter.Subscription
-	mu   sync.Mutex
+	state mcpState
+	subs  []filter.Subscription
+	mu    sync.Mutex
 }
 
 // list snapshots the set. The parsed subscriptions and their fields are immutable.
@@ -319,6 +320,12 @@ func (s *mcpSubscriptions) set(sub filter.Subscription, add bool) bool {
 		s.subs = slices.Delete(s.subs, index, index+1)
 	default:
 		return false
+	}
+
+	// Keep the write under the same lock as the change so concurrent tools
+	// cannot persist an older snapshot over a newer one.
+	if s.state.file != "" && !s.state.write(s.subs) {
+		s.state.logger.Warn(mcpStateWriteWarning)
 	}
 
 	return true
