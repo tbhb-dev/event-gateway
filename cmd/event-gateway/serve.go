@@ -171,10 +171,20 @@ func serve(ctx context.Context, out io.Writer, logHandler slog.Handler, args []s
 		return err
 	}
 
-	targets, err := loadTargets(cfg.targets, targetTypes)
+	targets, closeTargets, err := loadTargets(cfg.targets, targetTypes)
 	if err != nil {
 		return err
 	}
+
+	var closeStore func()
+
+	// withParked releases the listener before these deferred closes run.
+	defer func() {
+		if closeStore != nil {
+			closeStore()
+		}
+	}()
+	defer closeTargets()
 
 	var tokens readTokens
 	if cfg.readListen != "" {
@@ -202,25 +212,25 @@ func serve(ctx context.Context, out io.Writer, logHandler slog.Handler, args []s
 	}
 
 	return cfg.withParked(ctx, targets, func(parked parkedService) error {
-		return cfg.start(ctx, logHandler, targets, &tokens, handler, grafana, parked)
+		options := storeOptions(cfg.storeDir)
+		options.JetStreamMaxMemory = cfg.maxMemory
+		options.JetStreamMaxStore = cfg.maxStore
+
+		store, stop, storeErr := openStore(ctx, options, retention)
+		if storeErr != nil {
+			return storeErr
+		}
+
+		closeStore = stop
+
+		return cfg.start(ctx, logHandler, store, targets, &tokens, handler, grafana, parked)
 	})
 }
 
 func (cfg *serveConfig) start(
-	ctx context.Context, logHandler slog.Handler, targets []runnerTarget, tokens *readTokens,
+	ctx context.Context, logHandler slog.Handler, store eventStore, targets []runnerTarget, tokens *readTokens,
 	handler *githubWebhook, grafana *grafanaWebhook, parked parkedService,
 ) error {
-	options := storeOptions(cfg.storeDir)
-	options.JetStreamMaxMemory = cfg.maxMemory
-	options.JetStreamMaxStore = cfg.maxStore
-
-	store, closeStore, err := openStore(ctx, options, retention)
-	if err != nil {
-		return err
-	}
-
-	defer closeStore()
-
 	signals, closeSignals, err := openTelemetry(ctx, logHandler, cfg.otlp)
 	if err != nil {
 		return err
