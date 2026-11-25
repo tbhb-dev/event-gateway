@@ -4,12 +4,14 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
 	"maps"
+	"net/http"
 	"os"
 	"slices"
 	"strings"
@@ -17,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -28,10 +31,16 @@ func TestMCPCommand(t *testing.T) {
 	t.Setenv(gatewayURLEnv, "")
 	t.Setenv(gatewayTokenEnv, "")
 
-	for _, cancelEarly := range []bool{false, true} {
-		reader, writer, err := os.Pipe()
-		checkError(t, err)
-
+	for _, test := range []struct {
+		want        error
+		cancelEarly bool
+		closeReader bool
+	}{
+		{want: nil, cancelEarly: false, closeReader: false},
+		{want: context.Canceled, cancelEarly: true, closeReader: false},
+		{want: nil, cancelEarly: false, closeReader: true},
+	} {
+		reader, writer := mcpTestPipe(t)
 		stdin := os.Stdin
 		os.Stdin = reader //nolint:reassign // Exercise the command's actual stdio transport.
 
@@ -40,23 +49,142 @@ func TestMCPCommand(t *testing.T) {
 		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 		t.Cleanup(cancel)
 
-		var want error
-
-		if cancelEarly {
+		switch {
+		case test.cancelEarly:
 			cancel()
-			t.Cleanup(func() { checkError(t, writer.Close()) })
-
-			want = context.Canceled
-		} else {
+		case test.closeReader:
+			checkError(t, reader.Close())
+		default:
 			checkError(t, writer.Close())
 		}
 
-		err = run(ctx, io.Discard, slog.DiscardHandler, []string{mcpCommand})
-		checkEqual(t, errors.Is(err, want), true)
+		err := run(ctx, io.Discard, slog.DiscardHandler, []string{mcpCommand})
+		checkEqual(t, errors.Is(err, test.want), true)
 	}
 
 	err := run(t.Context(), io.Discard, slog.DiscardHandler, []string{mcpCommand, "unexpected"})
 	checkEqual(t, errors.Is(err, errMCPUsage), true)
+}
+
+func TestMCPStdinCloseStopsGateway(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	disconnected := make(chan struct{})
+	server, _ := fakeMCPGateway(t, []int{http.StatusSwitchingProtocols}, func(conn *websocket.Conn) {
+		defer close(disconnected)
+
+		receiveGatewayHello(ctx, t, conn)
+		// Escaping expands this payload past the capacity of the stdout pipe.
+		event := `{"type":"event","provider":"github","event":"issues","payload":"` +
+			strings.Repeat("<", maxChannelContent-2) + `"}`
+		checkEqual(t, conn.Write(ctx, websocket.MessageText, []byte(event)) == nil, true)
+
+		_, _, err := conn.Read(ctx)
+		checkEqual(t, err != nil, true)
+	})
+	t.Setenv(gatewayURLEnv, server.URL+sessionPath)
+	t.Setenv(gatewayTokenEnv, mcpFixture)
+
+	input, clientInput := mcpTestPipe(t)
+	clientOutput, output := mcpTestPipe(t)
+	stdin, stdout := os.Stdin, os.Stdout
+	os.Stdin, os.Stdout = input, output //nolint:reassign // Exercise the command's actual stdio transport.
+
+	done := make(chan struct{})
+
+	var runErr error
+
+	go func() {
+		defer close(done)
+
+		runErr = runMCP(ctx, slog.DiscardHandler, nil)
+	}()
+
+	const timeout = 10 * time.Second
+
+	t.Cleanup(func() {
+		// Release a blocked writer even when the regression is present.
+		closeMCPTestPipe(t, clientOutput)
+
+		select {
+		case <-done:
+		case <-time.After(timeout):
+			t.Error("MCP server did not return during cleanup")
+		}
+
+		os.Stdin, os.Stdout = stdin, stdout //nolint:reassign // Restore the test process's stdio.
+	})
+
+	started := make(chan error, 1)
+	go func() { started <- startMCPPipeClient(clientInput, clientOutput) }()
+
+	select {
+	case err := <-started:
+		checkError(t, err)
+	case <-time.After(timeout):
+		t.Fatal("MCP server did not start writing the gateway notification")
+	}
+
+	checkError(t, clientInput.Close())
+
+	select {
+	case <-done:
+		checkError(t, runErr)
+	case <-time.After(timeout):
+		t.Fatal("MCP server did not return after stdin closed with stdout blocked")
+	}
+
+	select {
+	case <-disconnected:
+	case <-time.After(timeout):
+		t.Fatal("MCP gateway stayed connected after stdin closed")
+	}
+}
+
+func startMCPPipeClient(input io.Writer, output io.Reader) error {
+	reader := bufio.NewReader(output)
+
+	_, err := io.WriteString(input, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{`+
+		`"clientInfo":{"name":"claude-code","version":"test"},"protocolVersion":"2025-11-25","capabilities":{}}}`+"\n")
+	if err != nil {
+		return err //nolint:wrapcheck // Report the pipe failure to the test.
+	}
+
+	_, err = reader.ReadBytes('\n')
+	if err != nil {
+		return err //nolint:wrapcheck // Report the pipe failure to the test.
+	}
+
+	_, err = io.WriteString(input, `{"jsonrpc":"2.0","method":"notifications/initialized"}`+"\n")
+	if err != nil {
+		return err //nolint:wrapcheck // Report the pipe failure to the test.
+	}
+
+	// Stop reading as soon as the notification starts so its write stays blocked.
+	_, err = reader.ReadByte()
+
+	return err //nolint:wrapcheck // Report the pipe failure to the test.
+}
+
+func mcpTestPipe(t *testing.T) (*os.File, *os.File) {
+	t.Helper()
+
+	reader, writer, err := os.Pipe()
+	checkError(t, err)
+	t.Cleanup(func() { closeMCPTestPipe(t, reader) })
+	t.Cleanup(func() { closeMCPTestPipe(t, writer) })
+
+	return reader, writer
+}
+
+func closeMCPTestPipe(t *testing.T, pipe *os.File) {
+	t.Helper()
+
+	err := pipe.Close()
+	if !errors.Is(err, os.ErrClosed) {
+		checkError(t, err)
+	}
 }
 
 func connectMCP(t *testing.T) *mcp.ClientSession {

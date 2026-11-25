@@ -4,11 +4,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"os"
 	"reflect"
 	"slices"
 	"strings"
@@ -41,9 +44,10 @@ const (
 )
 
 var (
-	errMCPUsage      = errors.New("usage: event-gateway mcp")
-	errNoConnection  = errors.New("no MCP connection")
-	errChannelClient = errors.New("channel delivery requires a claude-code client")
+	errMCPUsage       = errors.New("usage: event-gateway mcp")
+	errMCPStdinClosed = errors.New("MCP stdin closed")
+	errNoConnection   = errors.New("no MCP connection")
+	errChannelClient  = errors.New("channel delivery requires a claude-code client")
 )
 
 //nolint:gochecknoglobals // Reuse the same immutable framing escapes for every notification.
@@ -54,21 +58,82 @@ func runMCP(ctx context.Context, logHandler slog.Handler, args []string) error {
 		return errMCPUsage
 	}
 
-	notifier := &notifyingTransport{inner: &mcp.StdioTransport{MaxLineLength: 0}, conn: nil, mu: sync.Mutex{}}
+	runCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+
+	transport := &mcp.IOTransport{
+		Reader:        mcpStdin{File: os.Stdin, cancel: cancel},
+		Writer:        mcpStdout{done: runCtx.Done(), file: os.Stdout},
+		MaxLineLength: 0,
+	}
+	notifier := &notifyingTransport{inner: transport, conn: nil, mu: sync.Mutex{}}
 	logger := slog.New(logHandler)
 	subs := loadMCPSubscriptions(ctx, logger)
 
-	initialized, stopGateway := startMCPGateway(ctx, subs.list, notifier, logger)
+	initialized, stopGateway := startMCPGateway(runCtx, subs.list, notifier, logger)
 	defer stopGateway()
 
 	server := newMCPServer(logger, subs, notifier, initialized)
 
+	// Let the SDK handle stdin EOF as a normal transport shutdown.
 	err := server.Run(ctx, notifier)
-	if err != nil {
+	if err != nil && !errors.Is(context.Cause(runCtx), errMCPStdinClosed) {
 		return fmt.Errorf("serve MCP: %w", err)
 	}
 
 	return nil
+}
+
+type mcpStdin struct {
+	*os.File
+
+	cancel context.CancelCauseFunc
+}
+
+func (in mcpStdin) Read(p []byte) (int, error) {
+	n, err := in.File.Read(p)
+	if errors.Is(err, io.EOF) || errors.Is(err, os.ErrClosed) {
+		in.cancel(errMCPStdinClosed)
+	}
+
+	return n, err //nolint:wrapcheck // Pass through the stdin read result to the transport.
+}
+
+type mcpStdout struct {
+	done <-chan struct{}
+	file *os.File
+}
+
+func (mcpStdout) Close() error { return nil }
+
+func (out mcpStdout) Write(data []byte) (int, error) {
+	select {
+	case <-out.done:
+		return 0, io.ErrClosedPipe
+	default:
+	}
+
+	type result struct {
+		err error
+		n   int
+	}
+
+	written := make(chan result, 1)
+	payload := bytes.Clone(data)
+
+	// An inherited stdout pipe can block inside Write after stdin closes.
+	// Let the transport and gateway worker unwind while the process exits.
+	go func() {
+		n, err := out.file.Write(payload)
+		written <- result{err: err, n: n}
+	}()
+
+	select {
+	case <-out.done:
+		return 0, io.ErrClosedPipe
+	case got := <-written:
+		return got.n, got.err
+	}
 }
 
 func newMCPServer(
