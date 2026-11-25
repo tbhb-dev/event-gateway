@@ -62,7 +62,8 @@ func startMCPGateway(
 }
 
 // runMCPGateway forwards live events and reconnects with capped backoff.
-// Each connection sends the current subscriptions without requesting replay.
+// Each connection sends the current subscriptions, including any restored at
+// startup, without requesting replay.
 func runMCPGateway(
 	ctx context.Context,
 	logger *slog.Logger,

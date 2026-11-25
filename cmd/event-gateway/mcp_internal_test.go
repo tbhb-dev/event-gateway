@@ -72,13 +72,21 @@ func connectMCPClient(
 ) (*mcp.ClientSession, *mcp.ServerSession, *notifyingTransport) {
 	t.Helper()
 
+	return connectMCPWithSubscriptions(t, new(mcpSubscriptions), name, notifications)
+}
+
+func connectMCPWithSubscriptions(
+	t *testing.T, subs *mcpSubscriptions, name string, notifications chan<- *jsonrpc.Request,
+) (*mcp.ClientSession, *mcp.ServerSession, *notifyingTransport) {
+	t.Helper()
+
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 
 	logger := slog.New(slog.DiscardHandler)
 	in, out := mcp.NewInMemoryTransports()
 	notifier := &notifyingTransport{inner: in, conn: nil, mu: sync.Mutex{}}
-	server := newMCPServer(logger, new(mcpSubscriptions), notifier, nil)
+	server := newMCPServer(logger, subs, notifier, nil)
 	peer, err := server.Connect(ctx, notifier, nil)
 	checkError(t, err)
 	t.Cleanup(func() { checkError(t, peer.Close()) })
