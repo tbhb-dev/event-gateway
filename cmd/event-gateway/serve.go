@@ -48,6 +48,7 @@ type serveConfig struct {
 	tokenFile  string
 	listen     string
 	storeDir   string
+	targets    string
 	bodyCap    int
 	maxMemory  int64
 	maxStore   int64
@@ -62,6 +63,7 @@ func (cfg *serveConfig) parse(out io.Writer, args []string) error {
 	flags.StringVar(&cfg.wsListen, "session-listen", "", "private session listen address")
 	flags.StringVar(&cfg.tokenFile, readTokenFileFlag, "", "read API bearer token hash file")
 	flags.StringVar(&cfg.storeDir, "store-dir", "/data/nats", "JetStream data directory")
+	flags.StringVar(&cfg.targets, "targets", "", "routing targets JSON file")
 	flags.Func("github-secret", "GitHub webhook secret (overrides file and environment)", func(value string) error {
 		cfg.secret = &value
 
@@ -166,6 +168,11 @@ func serve(ctx context.Context, out io.Writer, logHandler slog.Handler, args []s
 		return err
 	}
 
+	targets, err := loadTargets(cfg.targets, targetTypes)
+	if err != nil {
+		return err
+	}
+
 	var tokens readTokens
 	if cfg.readListen != "" {
 		tokens.path = cfg.tokenFile
@@ -213,11 +220,20 @@ func serve(ctx context.Context, out io.Writer, logHandler slog.Handler, args []s
 	handler.telemetry = signals
 
 	webhook := gatewayHTTP(cfg.listen, withGrafana(grafana, handler, store, signals))
+
+	return runWithTargets(ctx, store, signals, targets, func(ctx context.Context) error {
+		return cfg.runHTTP(ctx, &tokens, store, signals, webhook)
+	})
+}
+
+func (cfg *serveConfig) runHTTP(
+	ctx context.Context, tokens *readTokens, store eventStore, signals telemetry, webhook *http.Server,
+) error {
 	if cfg.readListen == "" {
 		return runHTTPServer(ctx, webhook)
 	}
 
-	api := readAPI{tokens: &tokens, store: store, telemetry: signals}
+	api := readAPI{tokens: tokens, store: store, telemetry: signals}
 
 	reader := gatewayHTTP(cfg.readListen, api.handler())
 	if cfg.wsListen != "" {
@@ -227,10 +243,10 @@ func serve(ctx context.Context, out io.Writer, logHandler slog.Handler, args []s
 
 		defer sessions.active.Wait()
 
-		return runHTTP(ctx, &tokens, signals.logger, webhook, reader, server)
+		return runHTTP(ctx, tokens, signals.logger, webhook, reader, server)
 	}
 
-	return runHTTP(ctx, &tokens, signals.logger, webhook, reader)
+	return runHTTP(ctx, tokens, signals.logger, webhook, reader)
 }
 
 func gatewayHTTP(address string, handler http.Handler) *http.Server {

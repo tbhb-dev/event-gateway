@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright Tony Burns
+# cspell:words eventfields
 
 load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
 load("@tbhb_rules//repo:defs.bzl", "repo_files")
@@ -21,12 +22,15 @@ go_library(
         "serve.go",
         "session.go",
         "store.go",
+        "targets.go",
         "telemetry.go",
     ],
     importpath = "go.tbhb.dev/event-gateway/cmd/event-gateway",
     visibility = ["//visibility:private"],
     deps = [
+        "//internal/eventfields",
         "//internal/filter",
+        "//internal/routing",
         "@com_github_coder_websocket//:websocket",
         "@com_github_go_logr_logr//:logr",
         "@com_github_nats_io_nats_go//:nats_go",
@@ -77,11 +81,14 @@ go_test(
         "runner_internal_test.go",
         "session_internal_test.go",
         "store_internal_test.go",
+        "targets_internal_test.go",
     ],
     embed = [":event-gateway_lib"],
     # The whole-module Go checks in the root package take the tests too.
     visibility = ["//:__pkg__"],
     deps = [
+        "//internal/eventfields",
+        "//internal/routing",
         "@com_github_coder_websocket//:websocket",
         "@com_github_go_logr_logr//funcr",
         "@com_github_nats_io_nats_go//:nats_go",

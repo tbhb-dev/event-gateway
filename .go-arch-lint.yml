@@ -36,7 +36,7 @@ deps:
   deploy:
     mayDependOn: [deploy]  # no imports from the module; go-arch-lint rejects an empty list
   cmd:
-    mayDependOn: [cmd, filter]
+    mayDependOn: [cmd, eventfields, filter, routing]
     canUse: [nats, telemetry, websocket]
   eventfields:
     mayDependOn: [eventfields, filter]
