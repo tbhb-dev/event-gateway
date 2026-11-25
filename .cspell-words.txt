@@ -16,6 +16,7 @@ buildcop
 buildifier
 buildmeta
 buildtag
+buildx
 cacheinfo
 cand
 capsys
@@ -115,6 +116,7 @@ nogo
 nohup
 nolint
 nolintlint
+nonroot
 nonstrings
 noremote
 nosandbox
@@ -167,6 +169,7 @@ testpaths
 tombi
 toolu
 tricolon
+trimpath
 ufffd
 uncomparables
 underef
