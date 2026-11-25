@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -127,6 +128,172 @@ func TestMCPStateLoad(t *testing.T) {
 		checkEqual(t, len(subs), test.count)
 		checkEqual(t, cursor, nil)
 		checkMCPStateLog(t, &logs, test.warning)
+	}
+}
+
+func awrelStatePaths(t *testing.T) (string, string) {
+	t.Helper()
+
+	dir := t.TempDir()
+	t.Setenv(mcpStateHomeEnv, dir)
+	setMCPStateKeys(t, [3]string{"", mcpStateTestKey, ""})
+	file := filepath.Join("sessions", fmt.Sprintf("%x.json", sha256.Sum256([]byte(mcpStateTestKey))))
+	legacy := filepath.Join(dir, "awrel", file)
+	checkError(t, os.MkdirAll(filepath.Dir(legacy), 0o700))
+
+	return filepath.Join(dir, "event-gateway", file), legacy
+}
+
+func mcpStateTestSubscriptions(count int) string {
+	items := make([]string, count)
+	for i := range items {
+		items[i] = strings.Replace(mcpStateTestSubscription, "owner/repo", "owner/repo"+strconv.Itoa(i), 1)
+	}
+
+	return strings.Join(items, ",")
+}
+
+func TestMCPStateAwrelImport(t *testing.T) {
+	own, legacy := awrelStatePaths(t)
+	t.Setenv(gatewayTokenEnv, mcpFixture)
+
+	document := `{"endpoint":"wss://example.invalid/old",` + mcpStateDocument(mcpStateTestSubscription)[1:]
+
+	var logs bytes.Buffer
+
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	checkEqual(t, loadMCPSubscriptions(t.Context(), logger).imported, false)
+	checkMCPStateLog(t, &logs, mcpStateReadWarning)
+	checkError(t, os.WriteFile(legacy, []byte(document), 0o600))
+	subs := loadMCPSubscriptions(t.Context(), logger)
+	checkEqual(t, subs.imported, true)
+	checkEqual(t, len(subs.list()), 1)
+	checkMCPStateLog(t, &logs, "")
+
+	data, err := os.ReadFile(own)
+	checkError(t, err)
+	checkEqual(t, string(data), mcpStateDocument(mcpStateTestSubscription))
+	data, err = os.ReadFile(legacy)
+	checkError(t, err)
+	checkEqual(t, string(data), document)
+
+	checkError(t, os.WriteFile(legacy, []byte("invalid"), 0o600))
+	subs = loadMCPSubscriptions(t.Context(), logger)
+	checkEqual(t, subs.imported, false)
+	checkEqual(t, len(subs.list()), 1)
+	checkMCPStateLog(t, &logs, "")
+}
+
+//nolint:paralleltest // The awrel state fixture sets process-wide environment variables.
+func TestMCPStateAwrelSkip(t *testing.T) {
+	own, legacy := awrelStatePaths(t)
+	checkError(t, os.WriteFile(legacy, []byte(mcpStateDocument(mcpStateTestSubscription)), 0o600))
+
+	var logs bytes.Buffer
+
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+
+	setMCPStateKeys(t, [3]string{})
+
+	subs := loadMCPSubscriptions(t.Context(), logger)
+	checkEqual(t, len(subs.list()), 0)
+	checkEqual(t, subs.imported, false)
+	checkMCPStateLog(t, &logs, "")
+
+	_, err := os.Stat(own)
+	checkEqual(t, os.IsNotExist(err), true)
+
+	setMCPStateKeys(t, [3]string{mcpStateTestKey, "", ""})
+	checkError(t, os.MkdirAll(own, 0o700))
+	subs = loadMCPSubscriptions(t.Context(), logger)
+	checkEqual(t, subs.imported, false)
+	checkMCPStateLog(t, &logs, mcpStateReadWarning)
+	checkError(t, os.Remove(own))
+
+	for _, test := range [][2]string{
+		{"invalid", mcpStateReadWarning},
+		{`{"version":2,"subscriptions":[]}`, mcpStateReadWarning},
+		{mcpStateDocument(""), ""},
+	} {
+		checkError(t, os.WriteFile(own, []byte(test[0]), 0o600))
+		subs = loadMCPSubscriptions(t.Context(), logger)
+		checkEqual(t, len(subs.list()), 0)
+		checkEqual(t, subs.imported, false)
+		checkMCPStateLog(t, &logs, test[1])
+
+		data, readErr := os.ReadFile(own)
+		checkError(t, readErr)
+		checkEqual(t, string(data), test[0])
+	}
+}
+
+//nolint:paralleltest // Each awrel state fixture sets process-wide environment variables.
+func TestMCPStateAwrelInvalid(t *testing.T) {
+	valid := mcpStateDocument(mcpStateTestSubscription)
+	for _, test := range []struct {
+		name, document string
+		count          int
+	}{
+		{"malformed", `{"version":1,"endpoint":"wss://example.invalid/old"`, 0},
+		{"version", strings.Replace(valid, `"version":1`, `"version":2`, 1), 0},
+		{"missing", `{"version":1}`, 0},
+		{"empty subscriptions", mcpStateDocument(""), 0},
+		{"oversized", valid + strings.Repeat(" ", awrelStateLimit+1-len(valid)), 0},
+		{"unreadable", "", 0},
+		{"invalid subscription", mcpStateDocument(`null,{"provider":"bad/provider"}`), 0},
+		{"partial", mcpStateDocument(`null,{"provider":"bad/provider"},` + mcpStateTestSubscription), 1},
+		{"too many", mcpStateDocument(mcpStateTestSubscriptions(subscriptionLimit + 1)), subscriptionLimit},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			own, legacy := awrelStatePaths(t)
+			if test.document == "" {
+				checkError(t, os.Mkdir(legacy, 0o700))
+			} else {
+				checkError(t, os.WriteFile(legacy, []byte(test.document), 0o600))
+			}
+
+			var logs bytes.Buffer
+
+			subs := loadMCPSubscriptions(t.Context(), slog.New(slog.NewTextHandler(&logs, nil)))
+			checkEqual(t, len(subs.list()), test.count)
+			checkEqual(t, subs.imported, test.count > 0)
+			checkMCPStateLog(t, &logs, awrelStateWarning)
+
+			data, err := os.ReadFile(own)
+
+			switch test.count {
+			case 0:
+				checkEqual(t, os.IsNotExist(err), true)
+			case 1:
+				checkError(t, err)
+				checkEqual(t, string(data), valid)
+			default:
+				checkError(t, err)
+				checkEqual(t, string(data), mcpStateDocument(mcpStateTestSubscriptions(subscriptionLimit)))
+			}
+		})
+	}
+}
+
+func TestMCPStateAwrelReadFailure(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	file := filepath.Join(dir, "outside.json")
+	root := filepath.Join(dir, "awrel")
+
+	checkError(t, os.WriteFile(file, []byte(mcpStateDocument(mcpStateTestSubscription)), 0o600))
+	checkError(t, os.Mkdir(root, 0o700))
+
+	for _, test := range [][2]string{{file, "session.json"}, {root, filepath.Join("..", filepath.Base(file))}} {
+		var logs bytes.Buffer
+
+		logger := slog.New(slog.NewTextHandler(&logs, nil))
+		subs := new(mcpSubscriptions)
+		checkEqual(t, loadAwrelSubscriptions(t.Context(), logger, test[0], test[1], subs), true)
+		checkEqual(t, subs.imported, false)
+		checkEqual(t, len(subs.list()), 0)
+		checkMCPStateLog(t, &logs, awrelStateWarning)
 	}
 }
 

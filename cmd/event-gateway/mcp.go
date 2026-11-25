@@ -283,6 +283,8 @@ type mcpSubscriptions struct {
 	state  mcpState
 	subs   []filter.Subscription
 	mu     sync.Mutex
+	// Set during startup and immutable once callers can access the subscriptions.
+	imported bool
 }
 
 func (s *mcpSubscriptions) list() []filter.Subscription {

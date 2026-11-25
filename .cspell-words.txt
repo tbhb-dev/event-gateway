@@ -4,6 +4,7 @@ addopts
 antithesishq
 ascm
 autouse
+awrel
 event-gateway
 bazelignore
 bazelisk
