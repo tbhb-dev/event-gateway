@@ -36,7 +36,7 @@ var (
 	errStoreLimit = errors.New("JetStream limits must be nonnegative")
 )
 
-var errReadFlags = errors.New("read API requires both -read-listen and -read-token-file")
+var errReadFlags = errors.New("invalid combination of -read-listen, -session-listen and -read-token-file")
 
 type serveConfig struct {
 	otlp       otlpConfig
@@ -63,7 +63,7 @@ func (cfg *serveConfig) parse(out io.Writer, args []string) error {
 	flags.StringVar(&cfg.listen, "listen", "127.0.0.1:8080", "HTTP listen address")
 	flags.StringVar(&cfg.readListen, readListenFlag, "", "private read API listen address")
 	flags.StringVar(&cfg.wsListen, "session-listen", "", "private session listen address")
-	flags.StringVar(&cfg.tokenFile, readTokenFileFlag, "", "read API bearer token hash file")
+	flags.StringVar(&cfg.tokenFile, readTokenFileFlag, "", "bearer token hash file for read and session listeners")
 	flags.StringVar(&cfg.storeDir, "store-dir", defaultStoreDir, "JetStream data directory")
 	flags.StringVar(&cfg.parkedPath, "parked-socket", os.Getenv(parkedSocketEnv), "parked API socket path")
 	flags.StringVar(&cfg.targets, "targets", "", "routing targets JSON file")
@@ -130,8 +130,8 @@ func (cfg *serveConfig) parse(out io.Writer, args []string) error {
 		return errBodyCap
 	case cfg.maxMemory < 0, cfg.maxStore < 0:
 		return errStoreLimit
-	case cfg.wsListen != "" && !provided[readTokenFileFlag],
-		provided[readListenFlag] != provided[readTokenFileFlag], provided[readListenFlag] && cfg.readListen == "":
+	case (cfg.readListen != "" || cfg.wsListen != "") != provided[readTokenFileFlag],
+		provided[readListenFlag] && cfg.readListen == "":
 		return errReadFlags
 	default:
 		return nil
@@ -186,8 +186,9 @@ func serve(ctx context.Context, out io.Writer, logHandler slog.Handler, args []s
 	}()
 	defer closeTargets()
 
-	var tokens readTokens
-	if cfg.readListen != "" {
+	var tokens *readTokens
+	if cfg.readListen != "" || cfg.wsListen != "" {
+		tokens = new(readTokens)
 		tokens.path = cfg.tokenFile
 
 		err = tokens.load()
@@ -223,7 +224,7 @@ func serve(ctx context.Context, out io.Writer, logHandler slog.Handler, args []s
 
 		closeStore = stop
 
-		return cfg.start(ctx, logHandler, store, targets, &tokens, handler, grafana, parked)
+		return cfg.start(ctx, logHandler, store, targets, tokens, handler, grafana, parked)
 	})
 }
 
@@ -251,24 +252,22 @@ func (cfg *serveConfig) start(
 func (cfg *serveConfig) runHTTP(
 	ctx context.Context, tokens *readTokens, store eventStore, signals telemetry, servers []httpService,
 ) error {
-	if cfg.readListen == "" {
-		return runHTTP(ctx, nil, signals.logger, servers...)
-	}
-
 	api := readAPI{tokens: tokens, store: store, telemetry: signals}
 
-	reader := gatewayHTTP(cfg.readListen, api.handler())
+	if cfg.readListen != "" {
+		servers = append(servers, gatewayHTTP(cfg.readListen, api.handler()))
+	}
+
 	if cfg.wsListen != "" {
 		sessions := newSessionAPI(api, helloTimeout)
 		server := gatewayHTTP(cfg.wsListen, http.HandlerFunc(sessions.connect))
 		server.RegisterOnShutdown(func() { close(sessions.stop) })
+		servers = append(servers, server)
 
 		defer sessions.active.Wait()
-
-		return runHTTP(ctx, tokens, signals.logger, append(servers, reader, server)...)
 	}
 
-	return runHTTP(ctx, tokens, signals.logger, append(servers, reader)...)
+	return runHTTP(ctx, tokens, signals.logger, servers...)
 }
 
 type httpService struct {
