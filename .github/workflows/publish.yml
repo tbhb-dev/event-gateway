@@ -3,7 +3,9 @@
 
 ---
 # Publishes the event-gateway container image to GitHub's container registry
-# on each push to main, and the job refuses any other ref. The job summary
+# on each push to main. The job-level if: is a case-insensitive expression
+# compare, so the first step repeats the check with an exact, case-sensitive
+# shell compare and fails the job for any other ref. The job summary
 # names the image digest, and deploy/up.sh takes that digest, so a deploy
 # never runs a tag.
 name: publish
@@ -22,7 +24,8 @@ concurrency:
 jobs:
   image:
     name: image
-    # workflow_dispatch can run from any branch; only main publishes.
+    # workflow_dispatch can run from any branch; only main publishes. The ==
+    # operator ignores case, so the first step does the exact check.
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-26.04
     timeout-minutes: 20
@@ -30,6 +33,12 @@ jobs:
       contents: read  # checkout
       packages: write  # push the image
     steps:
+      - name: Require the main branch
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          if [ "$REF" != "refs/heads/main" ]; then echo "Refusing to publish from a ref other than main" >&2; exit 1; fi
+
       - name: Harden the runner
         uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c  # v2.23.0
         with:
