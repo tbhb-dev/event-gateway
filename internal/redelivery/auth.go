@@ -22,6 +22,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -34,7 +35,7 @@ const (
 	jwtLifetime   = 9 * time.Minute
 )
 
-// Options configures GitHub App authentication. An empty BaseURL uses
+// Options configures GitHub App authentication and selects an organization webhook. An empty BaseURL uses
 // https://api.github.com. A nil HTTPClient uses http.DefaultClient, and a nil
 // Now uses time.Now.
 type Options struct {
@@ -43,18 +44,23 @@ type Options struct {
 	AppID          string
 	KeyFile        string
 	BaseURL        string
+	Org            string
 	InstallationID int64
+	HookID         int64
 }
 
 // Client exchanges GitHub App credentials for installation tokens.
 //
 //nolint:recvcheck // Value receivers redact copies, and authentication methods operate on the shared client.
 type Client struct {
-	key     *rsa.PrivateKey
-	cache   *tokenCache
-	path    string
-	options Options
+	key            *rsa.PrivateKey
+	cache          *tokenCache
+	path           string
+	deliveriesPath string
+	options        Options
 }
+
+var orgPattern = regexp.MustCompile(`^[A-Za-z0-9-]+$`)
 
 type tokenCache struct {
 	token installationToken
@@ -74,6 +80,10 @@ func (installationToken) LogValue() slog.Value { return slog.StringValue(redacte
 //
 //nolint:err113 // Key diagnostics report the configured path and discard parser and system details.
 func NewClient(options Options) (*Client, error) {
+	if !orgPattern.MatchString(options.Org) || options.HookID <= 0 {
+		return nil, errors.New("GitHub org must use ASCII letters, digits or hyphens, and hook ID must be positive")
+	}
+
 	data, err := os.ReadFile(options.KeyFile)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, fmt.Errorf("read GitHub App key %s: %w", options.KeyFile, fs.ErrNotExist)
@@ -93,7 +103,7 @@ func NewClient(options Options) (*Client, error) {
 	}
 
 	client := *cmp.Or(options.HTTPClient, http.DefaultClient)
-	// An installation JWT is only sent to the configured token endpoint.
+	// Keep credentials on the configured endpoints.
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 
 	options.HTTPClient = &client
@@ -102,6 +112,8 @@ func NewClient(options Options) (*Client, error) {
 	return &Client{
 		key: key, cache: new(tokenCache), options: options,
 		path: fmt.Sprintf("/app/installations/%d/access_tokens", options.InstallationID),
+
+		deliveriesPath: fmt.Sprintf("/orgs/%s/hooks/%d/deliveries", options.Org, options.HookID),
 	}, nil
 }
 
@@ -169,10 +181,7 @@ func (c *Client) Token(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("POST %s: create token request", c.path)
 	}
 
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("X-Github-Api-Version", "2022-11-28")
-	req.Header.Set("User-Agent", "event-gateway")
-	req.Header.Set("Authorization", "Bearer "+jwt)
+	setGitHubHeaders(req, jwt)
 
 	res, err := c.options.HTTPClient.Do(req)
 	if err != nil {
@@ -196,6 +205,13 @@ func (c *Client) Token(ctx context.Context) (string, error) {
 	cache.token = token
 
 	return token.Token, nil
+}
+
+func setGitHubHeaders(req *http.Request, token string) {
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-Github-Api-Version", "2022-11-28")
+	req.Header.Set("User-Agent", "event-gateway")
+	req.Header.Set("Authorization", "Bearer "+token)
 }
 
 func (c *Client) sign(now time.Time) (string, bool) {

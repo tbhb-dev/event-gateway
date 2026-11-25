@@ -8,7 +8,10 @@ repo_files()
 
 go_library(
     name = "redelivery",
-    srcs = ["auth.go"],
+    srcs = [
+        "auth.go",
+        "deliveries.go",
+    ],
     importpath = "go.tbhb.dev/event-gateway/internal/redelivery",
     visibility = ["//:__subpackages__"],
 )
