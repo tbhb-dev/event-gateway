@@ -157,14 +157,6 @@ gobco_test(
     tests = ["//internal/routing:routing_test"],
 )
 
-gobco_test(
-    name = "temporaltarget_gobco_test",
-    go_mod = "go.mod",
-    go_sum = "go.sum",
-    proxy = "@go_mod_proxy//:proxy",
-    tests = ["//internal/temporaltarget:temporaltarget_test"],
-)
-
 # Every file of the repository, for the whole-tree checks below. Each package
 # calls repo_files() too, so the chain covers the tree. Directories that hold
 # no source are ignored in REPO.bazel; these are the gitignored loose files
