@@ -5,6 +5,7 @@
 package redelivery
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"crypto"
@@ -114,24 +115,27 @@ func (Client) GoString() string { return redacted }
 func (Client) LogValue() slog.Value { return slog.StringValue(redacted) }
 
 func parseKey(data []byte) *rsa.PrivateKey {
-	block, _ := pem.Decode(data)
-	if block == nil {
+	block, rest := pem.Decode(data)
+	if block == nil || len(bytes.TrimSpace(rest)) != 0 || len(block.Headers) != 0 {
 		return nil
 	}
 
-	if block.Type == "RSA PRIVATE KEY" {
+	switch block.Type {
+	case "RSA PRIVATE KEY":
 		//nolint:errcheck // The parser returns a nil key on failure, and the error may include key details.
 		key, _ := x509.ParsePKCS1PrivateKey(block.Bytes)
 
 		return key
+	case "PRIVATE KEY":
+		//nolint:errcheck // A failed parse or a non-RSA key produces a nil RSA key below.
+		key, _ := x509.ParsePKCS8PrivateKey(block.Bytes)
+		//nolint:errcheck // A non-RSA key is rejected by returning nil.
+		rsaKey, _ := key.(*rsa.PrivateKey)
+
+		return rsaKey
 	}
 
-	//nolint:errcheck // A failed parse or a non-RSA key produces a nil RSA key below.
-	key, _ := x509.ParsePKCS8PrivateKey(block.Bytes)
-	//nolint:errcheck // A non-RSA key is rejected by returning nil.
-	rsaKey, _ := key.(*rsa.PrivateKey)
-
-	return rsaKey
+	return nil
 }
 
 // Invalidate drops the cached installation token.
@@ -143,6 +147,8 @@ func (c *Client) Invalidate() {
 }
 
 // Token returns an installation token, refreshing it two minutes before expiry.
+//
+//nolint:err113 // Exchange diagnostics retain the method, path and status and discard secret-bearing errors.
 func (c *Client) Token(ctx context.Context) (string, error) {
 	cache := c.cache
 	cache.mu.Lock()
@@ -153,26 +159,14 @@ func (c *Client) Token(ctx context.Context) (string, error) {
 		return cache.token.Token, nil
 	}
 
-	token, err := c.exchange(ctx, now)
-	if err != nil {
-		return "", err
-	}
-
-	cache.token = token
-
-	return token.Token, nil
-}
-
-//nolint:err113 // Exchange diagnostics retain the method, path and status and discard secret-bearing errors.
-func (c *Client) exchange(ctx context.Context, now time.Time) (installationToken, error) {
 	jwt, ok := c.sign(now)
 	if !ok {
-		return installationToken{}, fmt.Errorf("POST %s: sign GitHub App JWT", c.path)
+		return "", fmt.Errorf("POST %s: sign GitHub App JWT", c.path)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.options.BaseURL+c.path, nil)
 	if err != nil {
-		return installationToken{}, fmt.Errorf("POST %s: create token request", c.path)
+		return "", fmt.Errorf("POST %s: create token request", c.path)
 	}
 
 	req.Header.Set("Accept", "application/vnd.github+json")
@@ -182,24 +176,26 @@ func (c *Client) exchange(ctx context.Context, now time.Time) (installationToken
 
 	res, err := c.options.HTTPClient.Do(req)
 	if err != nil {
-		return installationToken{}, fmt.Errorf("POST %s: send token request", c.path)
+		return "", fmt.Errorf("POST %s: send token request", c.path)
 	}
 
 	defer res.Body.Close()
 
 	if res.StatusCode != http.StatusCreated {
-		return installationToken{}, fmt.Errorf("POST %s: HTTP %d", c.path, res.StatusCode)
+		return "", fmt.Errorf("POST %s: HTTP %d", c.path, res.StatusCode)
 	}
 
 	data, err := io.ReadAll(io.LimitReader(res.Body, responseLimit+1))
 
 	var token installationToken
 	if err != nil || len(data) > responseLimit || json.Unmarshal(data, &token) != nil ||
-		token.Token == "" || token.ExpiresAt.IsZero() {
-		return installationToken{}, fmt.Errorf("POST %s: HTTP %d invalid token response", c.path, res.StatusCode)
+		token.Token == "" || token.ExpiresAt.IsZero() || !token.ExpiresAt.After(now.Add(refreshBefore)) {
+		return "", fmt.Errorf("POST %s: HTTP %d invalid token response", c.path, res.StatusCode)
 	}
 
-	return token, nil
+	cache.token = token
+
+	return token.Token, nil
 }
 
 func (c *Client) sign(now time.Time) (string, bool) {

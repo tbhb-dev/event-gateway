@@ -8,6 +8,7 @@ package redelivery //nolint:testpackage // Exercise redaction and signer failure
 import (
 	"bytes"
 	"crypto"
+	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -24,8 +25,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
 	"time"
 )
 
@@ -36,14 +39,12 @@ const (
 	testAppID   = "12345"
 )
 
-//nolint:cyclop,gocognit // The full request and cache sequence is checked in one scenario.
 func TestTokenCacheAndJWT(t *testing.T) {
 	t.Parallel()
 
 	key := testKey(t)
-	file := writeKey(t, "RSA PRIVATE KEY", x509.MarshalPKCS1PrivateKey(key))
 	start := time.Unix(0, 0).UTC()
-	now, expiry := start, start.Add(time.Hour).Format(time.RFC3339)
+	now := start
 
 	var calls atomic.Int32
 
@@ -56,212 +57,231 @@ func TestTokenCacheAndJWT(t *testing.T) {
 
 		call := calls.Add(1)
 		if call == 1 {
-			verifyJWT(t, strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer "), &key.PublicKey, start)
+			verifyJWT(t, req.Header.Get("Authorization"), &key.PublicKey, start)
 		}
 
 		writer.WriteHeader(http.StatusCreated)
-
-		_, err := fmt.Fprintf(writer, `{"token":%q,"expires_at":%q}`, fmt.Sprint(secretToken, call), expiry)
-		if err != nil {
-			t.Error("write token response")
-		}
+		//nolint:errcheck // The client reports an incomplete response.
+		_, _ = io.Copy(writer, tokenResponse(fmt.Sprint(secretToken, call), start.Add(time.Duration(call)*time.Hour)))
 	}))
 	t.Cleanup(server.Close)
 
+	file := keyFile(t, keyPEM("RSA PRIVATE KEY", x509.MarshalPKCS1PrivateKey(key)))
 	clock := func() time.Time { return now }
-	client := mustClient(t, Options{server.Client(), clock, testAppID, file, server.URL + "/", 42})
+	client, err := NewClient(Options{server.Client(), clock, testAppID, file, server.URL + "/", 42})
+	noError(t, err)
 
-	for _, want := range []int32{1, 1, 2, 3} {
-		token, err := client.Token(t.Context())
-		if err != nil || token != fmt.Sprint(secretToken, want) || calls.Load() != want {
-			t.Fatalf("token exchange %d failed: %v", want, err)
-		}
+	check := func(want int32) {
+		t.Helper()
 
-		switch want {
-		case 1:
-			now = now.Add(29 * time.Minute)
-		case 2:
-			client.Invalidate()
+		token, tokenErr := client.Token(t.Context())
+		if tokenErr != nil || token != fmt.Sprint(secretToken, want) || calls.Load() != want {
+			t.Fatalf("token exchange %d failed: %v", want, tokenErr)
 		}
 	}
+	check(1)
+	check(1)
 
-	var logs bytes.Buffer
+	now = start.Add(58 * time.Minute)
 
-	logger := slog.New(slog.NewTextHandler(&logs, nil))
-	logger.InfoContext(t.Context(), "credentials", "client", client, "record", client.cache.token)
+	check(2)
+
+	client.Invalidate()
+	check(3)
 
 	for _, value := range []any{client, *client, client.cache.token} {
-		if fmt.Sprintf("%v %+v %#v", value, value, value) != strings.Repeat(redacted+" ", 2)+redacted {
-			t.Fatal("formatter exposed credentials")
+		if fmt.Sprintf("%v %+v %#v", value, value, value) != strings.Repeat(redacted+" ", 2)+redacted ||
+			slog.AnyValue(value).Resolve().String() != redacted {
+			t.Fatal("formatter or logger exposed credentials")
 		}
 	}
 
-	if strings.Count(logs.String(), redacted) != 2 || strings.Contains(logs.String(), secretToken) {
-		t.Fatal("logger exposed credentials")
-	}
+	checkConcurrentTokens(t, client)
 }
 
-func verifyJWT(t *testing.T, jwt string, key *rsa.PublicKey, now time.Time) {
+func checkConcurrentTokens(t *testing.T, client *Client) {
 	t.Helper()
 
-	parts := strings.Split(jwt, ".")
-	if len(parts) != 3 {
-		t.Error("expected a three-part JWT")
+	var group sync.WaitGroup
+	for range 16 {
+		group.Go(func() {
+			client.Invalidate()
 
-		return
+			token, err := client.Token(t.Context())
+			if token == "" || err != nil {
+				t.Error("expected a token and no error")
+			}
+		})
 	}
 
-	encoding := base64.RawURLEncoding
-	sig, err := encoding.DecodeString(parts[2])
-	digest := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
-	claims := fmt.Sprintf(`{"iss":%q,"iat":%d,"exp":%d}`, testAppID, now.Unix()-60, now.Unix()+540)
+	group.Wait()
+}
 
-	if err != nil || parts[0] != encoding.EncodeToString([]byte(`{"alg":"RS256","typ":"JWT"}`)) ||
-		parts[1] != encoding.EncodeToString([]byte(claims)) ||
-		rsa.VerifyPKCS1v15(key, crypto.SHA256, digest[:], sig) != nil {
+func verifyJWT(t *testing.T, auth string, key *rsa.PublicKey, now time.Time) {
+	t.Helper()
+
+	encoding := base64.RawURLEncoding
+	claims := fmt.Sprintf(`{"iss":%q,"iat":%d,"exp":%d}`, testAppID, now.Unix()-60, now.Unix()+540)
+	header := encoding.EncodeToString([]byte(`{"alg":"RS256","typ":"JWT"}`))
+	unsigned := header + "." + encoding.EncodeToString([]byte(claims))
+	sig, ok := strings.CutPrefix(auth, "Bearer "+unsigned+".")
+	decoded, err := encoding.DecodeString(sig)
+	digest := sha256.Sum256([]byte(unsigned))
+
+	if !ok || err != nil || rsa.VerifyPKCS1v15(key, crypto.SHA256, digest[:], decoded) != nil {
 		t.Error("JWT header, claims, or signature did not match")
 	}
 }
 
-func TestKeyLoading(t *testing.T) {
+func TestKeyErrors(t *testing.T) {
 	t.Parallel()
 
-	der, err := x509.MarshalPKCS8PrivateKey(testKey(t))
-	if err != nil {
-		t.Fatal(err)
-	}
+	der := pkcs8(t, testKey(t))
+	key := keyPEM("PRIVATE KEY", der)
+	nonRSA := ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize))
+	encrypted := &pem.Block{Type: "PRIVATE KEY", Bytes: der, Headers: map[string]string{"Proc-Type": "4,ENCRYPTED"}}
 
-	client := mustClient(t, Options{nil, nil, testAppID, writeKey(t, "PRIVATE KEY", der), "", 0})
-	file := writeKey(t, "RSA PRIVATE KEY", []byte(secretKey))
-	dir := t.TempDir()
-	missing := filepath.Join(dir, "missing.pem")
+	for name, data := range map[string][]byte{
+		"invalid RSA":       keyPEM("RSA PRIVATE KEY", []byte(secretKey)),
+		"invalid PKCS8":     keyPEM("PRIVATE KEY", []byte(secretKey)),
+		"non-RSA":           keyPEM("PRIVATE KEY", pkcs8(t, nonRSA)),
+		"encrypted header":  pem.EncodeToMemory(encrypted),
+		"extra key":         bytes.Repeat(key, 2),
+		"extra certificate": append(bytes.Clone(key), keyPEM("CERTIFICATE", der)...),
+		"trailing data":     append(bytes.Clone(key), secretKey...),
+		"wrong type":        keyPEM("PUBLIC KEY", der),
+		"malformed":         []byte("invalid\n" + secretKey),
+		"empty":             nil,
+	} {
+		path := keyFile(t, data)
 
-	malformed := writeKey(t, "invalid\n"+secretKey, nil)
-
-	for _, path := range []string{dir, missing, file, malformed, writeKey(t, "PRIVATE KEY", []byte(secretKey))} {
-		_, err = NewClient(Options{nil, nil, "", path, "", 0})
-		if err == nil || !strings.Contains(err.Error(), path) || strings.Contains(err.Error(), secretKey) ||
-			errors.Is(err, fs.ErrNotExist) != (path == missing) {
-			t.Fatal("expected a path-only key error with the correct cause")
+		_, err := NewClient(Options{nil, nil, "", path, "", 0})
+		if err == nil || err.Error() != "parse GitHub App RSA key "+path {
+			t.Errorf("%s: expected a path-only parse error", name)
 		}
 	}
 
-	client.key = new(rsa.PrivateKey)
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "missing.pem")
 
-	_, err = client.Token(t.Context())
-	if err == nil || !strings.Contains(err.Error(), "sign GitHub App JWT") {
-		t.Fatal("expected a signing error")
+	for _, path := range []string{dir, missing} {
+		_, err := NewClient(Options{nil, nil, "", path, "", 0})
+		if err == nil || !strings.Contains(err.Error(), path) || errors.Is(err, fs.ErrNotExist) != (path == missing) {
+			t.Fatal("expected a path-only read error with the correct cause")
+		}
 	}
 }
 
 func TestExchangeErrors(t *testing.T) {
 	t.Parallel()
 
-	key := writeKey(t, "RSA PRIVATE KEY", x509.MarshalPKCS1PrivateKey(testKey(t)))
-
 	now := time.Unix(0, 0).UTC()
-	client := mustClient(t, Options{nil, func() time.Time { return now }, testAppID, key, ":", 42})
-	_, err := client.Token(t.Context())
-	assertExchangeError(t, err, "create token request", secretKey)
+	key := keyPEM("PRIVATE KEY", pkcs8(t, testKey(t)))
+	client, err := NewClient(Options{nil, nil, testAppID, keyFile(t, append(key, " \t\n"...)), ":", 42})
+	noError(t, err)
 
-	jwt, ok := client.sign(now)
-	if !ok {
-		t.Fatal("sign test JWT")
-	}
+	client.options.Now = func() time.Time { return now }
+	assertTokenError(t, client, "invalid URL", "create token request")
 
+	client.options.BaseURL = "https://example.test"
+
+	badExpiry := `{"token":"` + secretToken + `","expires_at":"` + secretKey + `"}`
 	for _, test := range []struct {
-		body   string
+		body   io.Reader
+		name   string
 		status int
 	}{
-		{secretToken, http.StatusUnauthorized},
-		{secretToken, http.StatusForbidden},
-		{secretToken, http.StatusFound},
-		{"invalid", http.StatusCreated},
-		{`{"expires_at":"2026-01-01T01:00:00Z"}`, http.StatusCreated},
-		{`{"token":"` + secretToken + `"}`, http.StatusCreated},
-		{strings.Repeat(" ", responseLimit+1), http.StatusCreated},
-		{"", http.StatusCreated},
+		{strings.NewReader(secretToken), "unauthorized", http.StatusUnauthorized},
+		{strings.NewReader(secretToken), "forbidden", http.StatusForbidden},
+		{strings.NewReader(secretToken), "redirect", http.StatusFound},
+		{strings.NewReader(secretKey), "invalid JSON", http.StatusCreated},
+		{tokenResponse("", now.Add(time.Hour)), "missing token", http.StatusCreated},
+		{strings.NewReader(`{"token":"` + secretToken + `"}`), "missing expiry", http.StatusCreated},
+		{strings.NewReader(badExpiry), "unparsable expiry", http.StatusCreated},
+		{tokenResponse(secretToken, now.Add(-time.Hour)), "expired", http.StatusCreated},
+		{tokenResponse(secretToken, now.Add(time.Minute)), "inside margin", http.StatusCreated},
+		{tokenResponse(secretToken, now.Add(2*time.Minute)), "at margin", http.StatusCreated},
+		{strings.NewReader(strings.Repeat(" ", responseLimit+1)), "oversized", http.StatusCreated},
+		{iotest.ErrReader(io.ErrUnexpectedEOF), "read error", http.StatusCreated},
 	} {
-		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, req *http.Request) {
+		client.options.HTTPClient.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			if req.URL.Path != tokenPath {
 				t.Error("token request followed a redirect")
 			}
 
-			writer.Header().Set("Location", "/other")
+			//nolint:exhaustruct_v5 // The transport supplies only fields used by the client.
+			return &http.Response{
+				StatusCode: test.status, Header: http.Header{"Location": {"/other"}}, Body: io.NopCloser(test.body),
+			}, nil
+		})
 
-			if test.body == "" {
-				writer.Header().Set("Content-Length", "1")
-			}
-
-			body := test.body
-			if test.status != http.StatusCreated {
-				body += req.Header.Get("Authorization")
-			}
-
-			writer.WriteHeader(test.status)
-			//nolint:errcheck,gosec // The test server echoes a synthetic JWT and the client may close early.
-			_, _ = io.WriteString(writer, body)
-		}))
-		client.options.BaseURL = server.URL
-		_, err = client.Token(t.Context())
-
-		server.Close()
-		assertExchangeError(t, err, fmt.Sprintf("HTTP %d", test.status), jwt)
+		assertTokenError(t, client, test.name, fmt.Sprintf("HTTP %d", test.status))
 	}
 
 	client.options.HTTPClient.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		//nolint:err113 // Deliberately simulate a transport error containing the Authorization header.
+		//nolint:err113 // Simulate a transport error containing the Authorization header.
 		return nil, errors.New(req.Header.Get("Authorization") + secretToken)
 	})
-	_, err = client.Token(t.Context())
-	assertExchangeError(t, err, "send token request", "Bearer ")
+	assertTokenError(t, client, "transport", "send token request")
+	client.key = new(rsa.PrivateKey)
+	assertTokenError(t, client, "sign", "sign GitHub App JWT")
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
 
-func assertExchangeError(t *testing.T, err error, detail, secret string) {
+func tokenResponse(token string, expiry time.Time) *strings.Reader {
+	return strings.NewReader(fmt.Sprintf(`{"token":%q,"expires_at":%q}`, token, expiry.Format(time.RFC3339)))
+}
+
+func assertTokenError(t *testing.T, client *Client, name, detail string) {
 	t.Helper()
 
-	if err == nil || !strings.Contains(err.Error(), "POST "+tokenPath+": "+detail) ||
-		strings.Contains(err.Error(), secretToken) || strings.Contains(err.Error(), secret) {
-		t.Fatal("expected a redacted exchange error with method, path, and failure details")
+	var empty installationToken
+
+	token, err := client.Token(t.Context())
+	if token != "" || client.cache.token != empty || err == nil ||
+		strings.TrimSuffix(err.Error(), " invalid token response") != "POST "+tokenPath+": "+detail {
+		t.Errorf("%s: expected a redacted exchange error without a returned or cached token", name)
 	}
 }
 
-func mustClient(t *testing.T, options Options) *Client {
+func pkcs8(t *testing.T, key any) []byte {
 	t.Helper()
 
-	client, err := NewClient(options)
-	if err != nil {
-		t.Fatal(err)
-	}
+	der, err := x509.MarshalPKCS8PrivateKey(key)
+	noError(t, err)
 
-	return client
+	return der
 }
 
 func testKey(t *testing.T) *rsa.PrivateKey {
 	t.Helper()
 
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		t.Fatal(err)
-	}
+	noError(t, err)
 
 	return key
 }
 
-func writeKey(t *testing.T, kind string, der []byte) string {
+func keyPEM(kind string, der []byte) []byte {
+	return pem.EncodeToMemory(&pem.Block{Type: kind, Bytes: der, Headers: nil})
+}
+
+func keyFile(t *testing.T, data []byte) string {
 	t.Helper()
 
 	path := filepath.Join(t.TempDir(), "app.pem")
-	data := pem.EncodeToMemory(&pem.Block{Type: kind, Bytes: der, Headers: nil})
+	noError(t, os.WriteFile(path, data, 0o600))
 
-	err := os.WriteFile(path, data, 0o600)
+	return path
+}
+
+func noError(t *testing.T, err error) {
+	t.Helper()
+
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	return path
 }
