@@ -15,6 +15,7 @@ components:
   deploy: {in: deploy}
   eventfields: {in: internal/eventfields}
   filter: {in: internal/filter}
+  redelivery: {in: internal/redelivery}
   routing: {in: internal/routing}
   temporaltarget: {in: internal/temporaltarget}
 
@@ -47,6 +48,8 @@ deps:
     mayDependOn: [eventfields, filter]
   filter:
     mayDependOn: [filter]
+  redelivery:
+    mayDependOn: [redelivery]
   routing:
     mayDependOn: [routing, filter]
   temporaltarget:

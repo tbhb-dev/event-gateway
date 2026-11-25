@@ -88,6 +88,7 @@ GO_TARGETS = [
     "//deploy:deploy_test",
     "//internal/eventfields:eventfields_test",
     "//internal/filter:filter_test",
+    "//internal/redelivery:redelivery_test",
     "//internal/routing:routing_test",
     "//internal/temporaltarget:temporaltarget_devserver_test",
     "//internal/temporaltarget:temporaltarget_test",
@@ -148,6 +149,14 @@ gobco_test(
     go_sum = "go.sum",
     proxy = "@go_mod_proxy//:proxy",
     tests = ["//internal/filter:filter_test"],
+)
+
+gobco_test(
+    name = "redelivery_gobco_test",
+    go_mod = "go.mod",
+    go_sum = "go.sum",
+    proxy = "@go_mod_proxy//:proxy",
+    tests = ["//internal/redelivery:redelivery_test"],
 )
 
 gobco_test(
