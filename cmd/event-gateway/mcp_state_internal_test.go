@@ -117,12 +117,15 @@ func TestMCPStateLoad(t *testing.T) {
 		{`{"version":1,"subscriptions":[` + mcpStateTestSubscription + "]", mcpStateReadWarning, 0},
 		{`{"version":2,"subscriptions":[` + mcpStateTestSubscription + "]}", mcpStateReadWarning, 0},
 		{`{"version":1,"subscriptions":null}`, mcpStateReadWarning, 0},
+		{`{"version":1,"subscriptions":[],"cursor":-1}`, mcpStateReadWarning, 0},
 		{mcpStateDocument(mcpStateTestSubscription), "", 1},
-		{mcpStateDocument(mixed), mcpStateReadWarning, 1},
+		{`{"cursor":5,"version":1,"subscriptions":[` + mixed + `]}`, mcpStateReadWarning, 1},
 	} {
 		checkError(t, os.WriteFile(path, []byte(test.data), 0o600))
 		got := loadMCPSubscriptions(t.Context(), logger)
-		checkEqual(t, len(got.list()), test.count)
+		subs, cursor := got.snapshot()
+		checkEqual(t, len(subs), test.count)
+		checkEqual(t, cursor, nil)
 		checkMCPStateLog(t, &logs, test.warning)
 	}
 }
@@ -177,10 +180,14 @@ func TestMCPStateSaveFailure(t *testing.T) {
 	path := filepath.Join(dir, subs.state.file)
 	blocker := filepath.Join(dir, "blocker")
 	checkError(t, os.WriteFile(blocker, nil, 0o600))
-	checkEqual(t, (mcpState{logger: nil, dir: blocker, file: subs.state.file}).write(nil), false)
 
-	blocked := mcpState{logger: nil, dir: dir, file: filepath.Join("blocker", filepath.Base(path))}
-	checkEqual(t, blocked.write(nil), false)
+	blocked := subs.state
+	blocked.dir = blocker
+	checkEqual(t, blocked.write(nil, nil), false)
+
+	blocked.dir = dir
+	blocked.file = filepath.Join("blocker", filepath.Base(path))
+	checkEqual(t, blocked.write(nil, nil), false)
 	checkError(t, os.MkdirAll(path, 0o700))
 
 	session, _, _ := connectMCPWithSubscriptions(t, subs, "test", nil)
@@ -196,6 +203,44 @@ func TestMCPStateSaveFailure(t *testing.T) {
 	checkError(t, os.Remove(path))
 	checkEqual(t, callMCPTool(t, session, unsubscribeTool, mcpStateTestSubscription).IsError, false)
 	checkMCPStateLog(t, &logs, "")
+}
+
+func TestMCPStateCursorWriteFailure(t *testing.T) {
+	t.Setenv(mcpStateHomeEnv, t.TempDir())
+	setMCPStateKeys(t, [3]string{mcpStateTestKey, "", ""})
+
+	var logs bytes.Buffer
+
+	subs := loadMCPSubscriptions(t.Context(), slog.New(slog.NewTextHandler(&logs, nil)))
+	checkMCPStateLog(t, &logs, mcpStateReadWarning)
+
+	subs.state.writeFile = func(*os.File, []byte) (int, error) { return 0, io.ErrShortWrite }
+
+	var deliveries gatewayDeliveries
+
+	deliveries.ids = make(map[string]struct{})
+	frame := sessionJSON[sessionObject]([]byte(gatewayTestEvent(7, "github", "id")))
+	forwardGatewayFrame(frame, subs, &deliveries, func(channelEvent) bool { return false })
+	_, cursor := subs.snapshot()
+	checkEqual(t, cursor, nil)
+	checkMCPStateLog(t, &logs, "")
+
+	delivered := false
+
+	forwardGatewayFrame(frame, subs, &deliveries, func(channelEvent) bool {
+		_, before := subs.snapshot()
+		checkEqual(t, before, nil)
+
+		delivered = true
+
+		return true
+	})
+	checkEqual(t, delivered, true)
+
+	_, cursor = subs.snapshot()
+	checkEqual(t, cursor != nil, true)
+	checkEqual(t, *cursor, uint64(7))
+	checkMCPStateLog(t, &logs, mcpStateWriteWarning)
 }
 
 func TestMCPStateTempWriteFailure(t *testing.T) {

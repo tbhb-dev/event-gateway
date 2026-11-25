@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -23,11 +24,12 @@ import (
 )
 
 const (
-	gatewayURLEnv      = "EVENT_GATEWAY_URL"
-	gatewayTokenEnv    = "EVENT_GATEWAY_TOKEN"
-	gatewayRetryMin    = time.Second
-	gatewayRetryMax    = 30 * time.Second
-	gatewayRetryFactor = 2
+	gatewayURLEnv        = "EVENT_GATEWAY_URL"
+	gatewayTokenEnv      = "EVENT_GATEWAY_TOKEN"
+	gatewayRetryMin      = time.Second
+	gatewayRetryMax      = 30 * time.Second
+	gatewayRetryFactor   = 2
+	gatewayDeliveryLimit = 1000
 )
 
 var (
@@ -36,7 +38,7 @@ var (
 )
 
 func startMCPGateway(
-	ctx context.Context, subscriptions func() []filter.Subscription, notifier *notifyingTransport, logger *slog.Logger,
+	ctx context.Context, subscriptions *mcpSubscriptions, notifier *notifyingTransport, logger *slog.Logger,
 ) (func(context.Context, *mcp.InitializedRequest), func()) {
 	endpoint, token := os.Getenv(gatewayURLEnv), os.Getenv(gatewayTokenEnv)
 	if endpoint == "" || token == "" {
@@ -49,9 +51,11 @@ func startMCPGateway(
 
 	return func(_ context.Context, req *mcp.InitializedRequest) {
 			worker.Go(func() {
-				err := runMCPGateway(ctx, logger, endpoint, token, subscriptions, func(event channelEvent) {
+				err := runMCPGateway(ctx, logger, endpoint, token, subscriptions, func(event channelEvent) bool {
 					deliveryErr := notifier.deliverChannel(ctx, req.Session, event)
 					logger.DebugContext(ctx, "gateway notification", "delivered", deliveryErr == nil)
+
+					return deliveryErr == nil
 				}, waitGatewayRetry)
 				logger.DebugContext(ctx, "gateway client stopped", "failed", err != nil)
 			})
@@ -61,15 +65,14 @@ func startMCPGateway(
 		}
 }
 
-// runMCPGateway forwards live events and reconnects with capped backoff.
-// Each connection sends the current subscriptions, including any restored at
-// startup, without requesting replay.
+// runMCPGateway forwards events and reconnects with capped backoff, using
+// the current subscriptions and cursor on each connection.
 func runMCPGateway(
 	ctx context.Context,
 	logger *slog.Logger,
 	endpoint, token string,
-	subscriptions func() []filter.Subscription,
-	notify func(channelEvent),
+	subscriptions *mcpSubscriptions,
+	notify func(channelEvent) bool,
 	wait func(context.Context, time.Duration) bool,
 ) error {
 	warnInsecureGateway(ctx, logger, endpoint)
@@ -84,6 +87,10 @@ func runMCPGateway(
 
 	delay := gatewayRetryMin
 	ready, recovering := false, false
+
+	var deliveries gatewayDeliveries
+
+	deliveries.ids = make(map[string]struct{}, gatewayDeliveryLimit)
 	receive := func(kind websocket.MessageType, data []byte) {
 		ready = true
 
@@ -94,7 +101,7 @@ func runMCPGateway(
 		}
 
 		if kind == websocket.MessageText {
-			forwardGatewayFrame(sessionJSON[sessionObject](data), notify)
+			forwardGatewayFrame(sessionJSON[sessionObject](data), subscriptions, &deliveries, notify)
 		}
 	}
 
@@ -166,7 +173,7 @@ func runGatewayConnection(
 	logger *slog.Logger,
 	endpoint string,
 	options *websocket.DialOptions,
-	subscriptions func() []filter.Subscription,
+	subscriptions *mcpSubscriptions,
 	receive func(websocket.MessageType, []byte),
 ) error {
 	conn, response, err := websocket.Dial(ctx, endpoint, options)
@@ -190,7 +197,7 @@ func runGatewayConnection(
 	// The server may expand each payload byte to a JSON escape.
 	conn.SetReadLimit(int64(len(`\u003c`)*maxPayload + sessionFrameLimit))
 
-	frames, err := gatewayHelloFrames(subscriptions())
+	frames, err := gatewayHelloFrames(subscriptions.snapshot())
 	if err != nil {
 		return err
 	}
@@ -218,13 +225,13 @@ func runGatewayConnection(
 	return nil
 }
 
-func rejectGatewayToken(notify func(channelEvent)) error {
+func rejectGatewayToken(notify func(channelEvent) bool) error {
 	notify((channelNotice{Level: channelWarning, Text: "Gateway token was rejected."}).channelEvent())
 
 	return errGatewayToken
 }
 
-func gatewayHelloFrames(subscriptions []filter.Subscription) ([][]byte, error) {
+func gatewayHelloFrames(subscriptions []filter.Subscription, cursor *uint64) ([][]byte, error) {
 	const (
 		prefix = `{"type":"hello","subscriptions":[`
 		final  = `]}`
@@ -234,6 +241,10 @@ func gatewayHelloFrames(subscriptions []filter.Subscription) ([][]byte, error) {
 	var frames [][]byte
 
 	frame := []byte(prefix)
+	if cursor != nil {
+		frame = strconv.AppendUint([]byte(`{"type":"hello","resume_after":`), *cursor, decimal)
+		frame = append(frame, `,"subscriptions":[`...)
+	}
 
 	for index, sub := range subscriptions {
 		suffix := final
@@ -258,17 +269,53 @@ func gatewayHelloFrames(subscriptions []filter.Subscription) ([][]byte, error) {
 	return append(frames, append(bytes.TrimSuffix(frame, []byte(",")), final...)), nil
 }
 
-func forwardGatewayFrame(frame sessionObject, notify func(channelEvent)) {
+type gatewayDeliveries struct {
+	ids   map[string]struct{}
+	order [gatewayDeliveryLimit]string
+	next  int
+}
+
+func (d *gatewayDeliveries) remember(id string) {
+	delete(d.ids, d.order[d.next])
+	d.ids[id] = struct{}{}
+	d.order[d.next] = id
+	d.next = (d.next + 1) % len(d.order)
+}
+
+func forwardGatewayFrame(
+	frame sessionObject, subscriptions *mcpSubscriptions, deliveries *gatewayDeliveries, notify func(channelEvent) bool,
+) {
 	switch sessionJSON[string](frame[typeKey]) {
 	case channelEventKey:
-		notify(channelEvent{
+		event := channelEvent{
 			provider:   sessionJSON[string](frame[channelProviderKey]),
 			event:      sessionJSON[string](frame[channelEventKey]),
 			delivery:   sessionJSON[string](frame["delivery"]),
 			repository: sessionJSON[*string](frame[channelRepositoryKey]),
 			payload:    frame["payload"],
-		})
+		}
+		// Delivery IDs are scoped to their provider, as in the event store.
+		deliveryID := event.provider + ":" + event.delivery
+		if _, seen := deliveries.ids[deliveryID]; !seen {
+			if !notify(event) {
+				return
+			}
+
+			if event.delivery != "" {
+				deliveries.remember(deliveryID)
+			}
+		}
+	case "caught_up":
 	case "gap":
 		notify(gatewayGap(sessionJSON[uint64](frame["from"]), sessionJSON[uint64](frame["to"])).channelEvent())
+
+		return
+	default:
+		return
+	}
+
+	seq, err := strconv.ParseUint(string(frame["seq"]), decimal, 64)
+	if err == nil {
+		subscriptions.advanceCursor(seq)
 	}
 }

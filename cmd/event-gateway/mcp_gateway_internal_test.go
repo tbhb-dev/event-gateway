@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -80,7 +81,7 @@ func fakeMCPGateway(
 	return server, requests
 }
 
-func receiveGatewayHello(ctx context.Context, t *testing.T, conn *websocket.Conn) sessionObject {
+func receiveGatewayHello(ctx context.Context, t *testing.T, conn *websocket.Conn, resume string) sessionObject {
 	t.Helper()
 
 	kind, data, err := conn.Read(ctx)
@@ -90,7 +91,7 @@ func receiveGatewayHello(ctx context.Context, t *testing.T, conn *websocket.Conn
 
 	frame := sessionJSON[sessionObject](data)
 	checkEqual(t, string(frame[typeKey]) == `"hello"`, true)
-	checkEqual(t, frame["resume_after"] == nil, true)
+	checkEqual(t, string(frame[resumeKey]), resume)
 	checkEqual(t, frame["import"] == nil, true)
 
 	return frame
@@ -120,10 +121,10 @@ func TestMCPGatewayFrames(t *testing.T) {
 	checkMCPGatewayHelloBoundary(t, subs[:12])
 
 	server, requests := fakeMCPGateway(t, []int{http.StatusSwitchingProtocols}, func(conn *websocket.Conn) {
-		frame := receiveGatewayHello(ctx, t, conn)
+		frame := receiveGatewayHello(ctx, t, conn, "0")
 		checkEqual(t, string(frame["more"]) == "true", true)
 		got := sessionJSON[[]filter.Subscription](frame[subsKey])
-		frame = receiveGatewayHello(ctx, t, conn)
+		frame = receiveGatewayHello(ctx, t, conn, "")
 		checkEqual(t, frame["more"] == nil, true)
 		got = append(got, sessionJSON[[]filter.Subscription](frame[subsKey])...)
 		checkEqual(t, reflect.DeepEqual(got, subs), true)
@@ -144,9 +145,15 @@ func TestMCPGatewayFrames(t *testing.T) {
 
 	var messages []channelParameters
 
-	err := runMCPGateway(ctx, slog.New(slog.DiscardHandler), server.URL+sessionPath, mcpFixture,
-		func() []filter.Subscription { return subs },
-		func(event channelEvent) { messages = append(messages, channelParams(event)) },
+	state := new(mcpSubscriptions)
+	state.subs = subs
+	state.advanceCursor(0)
+	err := runMCPGateway(ctx, slog.New(slog.DiscardHandler), server.URL+sessionPath, mcpFixture, state,
+		func(event channelEvent) bool {
+			messages = append(messages, channelParams(event))
+
+			return true
+		},
 		func(context.Context, time.Duration) bool {
 			cancel()
 
@@ -171,13 +178,13 @@ func checkMCPGatewayHelloBoundary(t *testing.T, subscriptions []filter.Subscript
 
 	subs := slices.Clone(subscriptions)
 	subs[0].Repository += "xxxx" // Bring the combined frame from 4092 to 4096 bytes.
-	frames, err := gatewayHelloFrames(subs)
+	frames, err := gatewayHelloFrames(subs, nil)
 	checkEqual(t, err == nil, true)
 	checkEqual(t, len(frames), 1)
 	checkEqual(t, len(frames[0]), sessionFrameLimit)
 
 	subs[0].Repository += "x"
-	frames, err = gatewayHelloFrames(subs)
+	frames, err = gatewayHelloFrames(subs, nil)
 	checkEqual(t, err == nil, true)
 	checkEqual(t, len(frames), 2)
 
@@ -201,7 +208,7 @@ func TestMCPGatewayReconnect(t *testing.T) {
 
 	statuses := []int{fail, accept, accept, fail, fail, fail, fail, fail, fail, accept, accept}
 	server, requests := fakeMCPGateway(t, statuses, func(conn *websocket.Conn) {
-		frame := receiveGatewayHello(ctx, t, conn)
+		frame := receiveGatewayHello(ctx, t, conn, "")
 		got := sessionJSON[[]filter.Subscription](frame[subsKey])
 
 		switch connections.Add(1) {
@@ -233,8 +240,10 @@ func TestMCPGatewayReconnect(t *testing.T) {
 
 	options := &slog.HandlerOptions{Level: slog.LevelDebug, AddSource: false, ReplaceAttr: nil}
 	logger := slog.New(slog.NewTextHandler(&logs, options))
-	err = runMCPGateway(ctx, logger, server.URL+sessionPath, mcpFixture, subs.list, func(event channelEvent) {
+	err = runMCPGateway(ctx, logger, server.URL+sessionPath, mcpFixture, &subs, func(event channelEvent) bool {
 		notices = append(notices, sessionJSON[channelNotice](event.payload))
+
+		return true
 	}, func(_ context.Context, delay time.Duration) bool {
 		seconds = append(seconds, delay/time.Second)
 		noticeCounts = append(noticeCounts, len(notices))
@@ -260,6 +269,118 @@ func TestMCPGatewayReconnect(t *testing.T) {
 	checkEqual(t, strings.Contains(logs.String(), mcpFixture), false)
 }
 
+func TestMCPGatewayResume(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	t.Setenv(mcpStateHomeEnv, t.TempDir())
+	setMCPStateKeys(t, [3]string{mcpStateTestKey, "", ""})
+
+	logger := slog.New(slog.DiscardHandler)
+	subs := loadMCPSubscriptions(ctx, logger)
+	subs.advanceCursor(4)
+	subs = loadMCPSubscriptions(ctx, logger)
+	_, cursor := subs.snapshot()
+	checkEqual(t, cursor != nil, true)
+	checkEqual(t, *cursor, uint64(4))
+
+	sub, err := filter.Parse([]byte(mcpStateTestSubscription))
+	checkError(t, err)
+	checkEqual(t, subs.set(sub, true), true)
+
+	steps := [...]struct {
+		resume string
+		frames []string
+		cursor uint64
+	}{
+		{"4", []string{gatewayTestEvent(7, "github", "id")}, 7},
+		{"7", []string{gatewayTestEvent(9, "github", "id")}, 9},
+		{"9", []string{
+			`{"type":"caught_up","seq":12}`, `{"type":"gap","from":3,"to":5}`,
+			`{"type":"caught_up","seq":8}`,
+		}, 12},
+	}
+
+	var connections atomic.Int32
+
+	server, requests := fakeMCPGateway(t, []int{http.StatusSwitchingProtocols}, func(conn *websocket.Conn) {
+		step := steps[connections.Add(1)-1]
+		frame := receiveGatewayHello(ctx, t, conn, step.resume)
+		checkEqual(t, string(frame[subsKey]), "["+mcpStateTestSubscription+"]")
+
+		for _, data := range step.frames {
+			checkEqual(t, conn.Write(ctx, websocket.MessageText, []byte(data)) == nil, true)
+		}
+	})
+
+	var (
+		messages []string
+		retries  int
+	)
+
+	err = runMCPGateway(ctx, logger, server.URL+sessionPath, mcpFixture, loadMCPSubscriptions(ctx, logger),
+		func(event channelEvent) bool {
+			messages = append(messages, string(event.payload))
+
+			return true
+		}, func(context.Context, time.Duration) bool {
+			got, saved := loadMCPSubscriptions(ctx, logger).snapshot()
+			checkEqual(t, reflect.DeepEqual(got, []filter.Subscription{sub}), true)
+			checkEqual(t, saved != nil, true)
+			checkEqual(t, *saved, steps[retries].cursor)
+			retries++
+
+			return retries < len(steps)
+		})
+	checkError(t, err)
+	checkEqual(t, requests.Load(), int32(len(steps)))
+	checkEqual(t, slices.Equal(messages, []string{
+		`{}`, string(gatewayConnectionLost().channelEvent().payload),
+		string(gatewayReconnected().channelEvent().payload), string(gatewayConnectionLost().channelEvent().payload),
+		string(gatewayReconnected().channelEvent().payload), string(gatewayGap(3, 5).channelEvent().payload),
+		string(gatewayConnectionLost().channelEvent().payload),
+	}), true)
+}
+
+func gatewayTestEvent(seq int, provider, delivery string) string {
+	return fmt.Sprintf(`{"type":"event","seq":%d,"provider":%q,"delivery":%q,"payload":{}}`, seq, provider, delivery)
+}
+
+func TestMCPGatewayDeliveryLimit(t *testing.T) {
+	t.Parallel()
+
+	subs := new(mcpSubscriptions)
+
+	var deliveries gatewayDeliveries
+
+	deliveries.ids = make(map[string]struct{})
+	count := 0
+	forward := func(data string) {
+		forwardGatewayFrame(sessionJSON[sessionObject]([]byte(data)), subs, &deliveries, func(channelEvent) bool {
+			count++
+
+			return true
+		})
+	}
+
+	forward(`{"type":"event","provider":"github"}`)
+
+	_, cursor := subs.snapshot()
+	checkEqual(t, cursor, nil)
+
+	for seq := 1; seq <= 1000; seq++ {
+		forward(gatewayTestEvent(seq, "github", strconv.Itoa(seq)))
+	}
+
+	forward(gatewayTestEvent(1001, "github", "1"))
+	checkEqual(t, count, 1001)
+	forward(gatewayTestEvent(1002, "grafana", "1"))
+	checkEqual(t, count, 1002)
+	forward(gatewayTestEvent(1003, "github", "1"))
+	checkEqual(t, count, 1003)
+	checkEqual(t, len(deliveries.ids), 1000)
+}
+
 func TestMCPGatewayCancelBackoff(t *testing.T) {
 	t.Parallel()
 
@@ -270,8 +391,8 @@ func TestMCPGatewayCancelBackoff(t *testing.T) {
 		checkEqual(t, waitGatewayRetry(ctx, time.Millisecond), true)
 
 		endpoint := "ws://" + mcpFixture + "@example.invalid:invalid"
-		err := runMCPGateway(ctx, slog.New(slog.DiscardHandler), endpoint, mcpFixture, new(mcpSubscriptions).list,
-			func(channelEvent) { t.Error("invalid dial produced a channel notification") },
+		err := runMCPGateway(ctx, slog.New(slog.DiscardHandler), endpoint, mcpFixture, new(mcpSubscriptions),
+			rejectTestNotification(t),
 			func(waitCtx context.Context, delay time.Duration) bool {
 				checkEqual(t, delay, time.Second)
 				time.AfterFunc(time.Millisecond, cancel)
@@ -292,7 +413,7 @@ func TestMCPGatewayRedirect(t *testing.T) {
 
 	server, requests := fakeMCPGateway(t, []int{http.StatusFound, http.StatusUnauthorized}, nil)
 	err := runMCPGateway(ctx, slog.New(slog.DiscardHandler), server.URL+sessionPath, mcpFixture,
-		new(mcpSubscriptions).list, func(channelEvent) { t.Error("redirect produced a channel notification") },
+		new(mcpSubscriptions), rejectTestNotification(t),
 		func(context.Context, time.Duration) bool { return false })
 	checkEqual(t, err == nil, true)
 	checkEqual(t, requests.Load(), 1)
@@ -328,7 +449,7 @@ func TestMCPGatewayRejection(t *testing.T) {
 			defer cancel()
 
 			server, requests := fakeMCPGateway(t, []int{status}, func(conn *websocket.Conn) {
-				checkEqual(t, string(receiveGatewayHello(ctx, t, conn)[subsKey]) == "[]", true)
+				checkEqual(t, string(receiveGatewayHello(ctx, t, conn, "")[subsKey]) == "[]", true)
 				checkEqual(t, conn.Close(tokenRevoked, mcpFixture) == nil, true)
 			})
 
@@ -338,8 +459,12 @@ func TestMCPGatewayRejection(t *testing.T) {
 			)
 
 			logger := slog.New(slog.DiscardHandler)
-			err := runMCPGateway(ctx, logger, server.URL+sessionPath, mcpFixture, subs.list,
-				func(event channelEvent) { notices = append(notices, channelParams(event)) },
+			err := runMCPGateway(ctx, logger, server.URL+sessionPath, mcpFixture, &subs,
+				func(event channelEvent) bool {
+					notices = append(notices, channelParams(event))
+
+					return true
+				},
 				func(context.Context, time.Duration) bool {
 					t.Error("token rejection scheduled a retry")
 
@@ -366,7 +491,7 @@ func TestMCPGatewayRejectionNotice(t *testing.T) {
 	t.Setenv(gatewayURLEnv, server.URL+sessionPath)
 	t.Setenv(gatewayTokenEnv, mcpFixture)
 
-	initialized, stop := startMCPGateway(ctx, new(mcpSubscriptions).list, notifier, slog.New(slog.DiscardHandler))
+	initialized, stop := startMCPGateway(ctx, new(mcpSubscriptions), notifier, slog.New(slog.DiscardHandler))
 	defer stop()
 
 	initialized(ctx, &mcp.InitializedRequest{Session: peer, Params: nil, Extra: nil})
@@ -397,9 +522,10 @@ func TestMCPGatewayInvalidHello(t *testing.T) {
 		var sub filter.Subscription
 
 		sub.Provider = provider
+		subs := new(mcpSubscriptions)
+		subs.subs = []filter.Subscription{sub}
 		err := runMCPGateway(ctx, slog.New(slog.DiscardHandler), server.URL+sessionPath, mcpFixture,
-			func() []filter.Subscription { return []filter.Subscription{sub} },
-			func(channelEvent) { t.Error("invalid hello produced a channel notification") }, waitGatewayRetry)
+			subs, rejectTestNotification(t), waitGatewayRetry)
 		checkEqual(t, errors.Is(err, errGatewayHello), true)
 	}
 }
@@ -435,7 +561,7 @@ func checkMCPGatewayLifetime(t *testing.T, name string) {
 	server, requests := fakeMCPGateway(t, []int{http.StatusSwitchingProtocols}, func(conn *websocket.Conn) {
 		defer close(disconnected)
 
-		checkEqual(t, string(receiveGatewayHello(ctx, t, conn)[subsKey]), "["+mcpStateTestSubscription+"]")
+		checkEqual(t, string(receiveGatewayHello(ctx, t, conn, "")[subsKey]), "["+mcpStateTestSubscription+"]")
 		checkEqual(t, conn.Write(ctx, websocket.MessageText, []byte(`{"type":"gap","from":3,"to":5}`)) == nil, true)
 
 		if name != claudeCodeClient {
@@ -455,7 +581,7 @@ func checkMCPGatewayLifetime(t *testing.T, name string) {
 	stop()
 	checkEqual(t, requests.Load(), 0)
 
-	initialized, stop := startMCPGateway(ctx, loadMCPSubscriptions(ctx, logger).list, notifier, logger)
+	initialized, stop := startMCPGateway(ctx, loadMCPSubscriptions(ctx, logger), notifier, logger)
 	defer stop()
 
 	initialized(ctx, &mcp.InitializedRequest{Session: peer, Params: nil, Extra: nil})
@@ -480,4 +606,14 @@ func checkMCPGatewayLifetime(t *testing.T, name string) {
 	stop()
 	checkEqual(t, requests.Load(), 1)
 	checkEqual(t, len(notifications), 0)
+}
+
+func rejectTestNotification(t *testing.T) func(channelEvent) bool {
+	t.Helper()
+
+	return func(channelEvent) bool {
+		t.Error("unexpected gateway notification")
+
+		return false
+	}
 }

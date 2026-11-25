@@ -34,9 +34,10 @@ const (
 )
 
 type mcpState struct {
-	logger *slog.Logger
-	dir    string
-	file   string
+	logger    *slog.Logger
+	writeFile func(*os.File, []byte) (int, error)
+	dir       string
+	file      string
 }
 
 // loadMCPSubscriptions restores the saved set before the gateway sends hello.
@@ -61,9 +62,10 @@ func loadMCPSubscriptions(ctx context.Context, logger *slog.Logger) *mcpSubscrip
 	}
 
 	state := mcpState{
-		logger: logger,
-		dir:    dir,
-		file:   filepath.Join(mcpServerName, "sessions", fmt.Sprintf("%x.json", sha256.Sum256([]byte(key)))),
+		logger:    logger,
+		dir:       dir,
+		file:      filepath.Join(mcpServerName, "sessions", fmt.Sprintf("%x.json", sha256.Sum256([]byte(key)))),
+		writeFile: (*os.File).Write,
 	}
 	if !state.load(subs) {
 		logger.WarnContext(ctx, mcpStateReadWarning)
@@ -87,6 +89,7 @@ func (state mcpState) load(subs *mcpSubscriptions) bool {
 	}
 
 	var saved struct {
+		Cursor        *uint64           `json:"cursor"`
 		Subscriptions []json.RawMessage `json:"subscriptions"`
 		Version       int               `json:"version"`
 	}
@@ -108,14 +111,40 @@ func (state mcpState) load(subs *mcpSubscriptions) bool {
 		subs.set(sub, true)
 	}
 
+	if valid {
+		subs.cursor = saved.Cursor
+	}
+
 	return valid
 }
 
-func (state mcpState) write(subs []filter.Subscription) bool {
+func (s *mcpSubscriptions) advanceCursor(seq uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.cursor == nil || seq > *s.cursor {
+		s.cursor = &seq
+		s.saveLocked()
+	}
+}
+
+// saveLocked keeps subscription and cursor writes in the order of their changes.
+func (s *mcpSubscriptions) saveLocked() {
+	if s.state.file != "" && !s.state.write(s.subs, s.cursor) {
+		s.state.logger.Warn(mcpStateWriteWarning)
+	}
+}
+
+func (state mcpState) write(subs []filter.Subscription, cursor *uint64) bool {
+	if subs == nil {
+		subs = []filter.Subscription{}
+	}
+
 	saved := struct {
+		Cursor        *uint64               `json:"cursor,omitempty"`
 		Subscriptions []filter.Subscription `json:"subscriptions"`
 		Version       int                   `json:"version"`
-	}{Version: mcpStateVersion, Subscriptions: subs}
+	}{Version: mcpStateVersion, Subscriptions: subs, Cursor: cursor}
 	//nolint:errcheck,errchkjson // The state contains only integers, strings and slices of those types.
 	data, _ := json.Marshal(saved)
 
@@ -138,7 +167,9 @@ func (state mcpState) write(subs []filter.Subscription) bool {
 		return false
 	}
 
-	return replaceMCPState(root, file, temp, state.file, data, file.Write)
+	return replaceMCPState(root, file, temp, state.file, data, func(data []byte) (int, error) {
+		return state.writeFile(file, data)
+	})
 }
 
 func replaceMCPState(
