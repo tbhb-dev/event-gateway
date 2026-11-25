@@ -126,6 +126,7 @@ owenlamont
 paralleltest
 perfsprint
 pflag
+pids
 pipefail
 posttooluse
 ppid
@@ -140,6 +141,7 @@ rollup
 rumdl
 runfile
 runfiles
+runsc
 rylignore
 sandboxed
 segmentio
@@ -166,6 +168,7 @@ tbhbdev
 testifylint
 testonly
 testpaths
+tmpfs
 tombi
 toolu
 tricolon

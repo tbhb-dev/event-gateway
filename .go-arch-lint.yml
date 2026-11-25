@@ -12,6 +12,7 @@ allow:
 
 components:
   cmd: {in: cmd/*}
+  deploy: {in: deploy}
   eventfields: {in: internal/eventfields}
   filter: {in: internal/filter}
   routing: {in: internal/routing}
@@ -32,6 +33,8 @@ vendors:
       - google.golang.org/protobuf/proto
 
 deps:
+  deploy:
+    mayDependOn: [deploy]  # no imports from the module; go-arch-lint rejects an empty list
   cmd:
     mayDependOn: [cmd, filter]
     canUse: [nats, telemetry, websocket]
