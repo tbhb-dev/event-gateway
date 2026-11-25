@@ -18,11 +18,15 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/coder/websocket"
 )
 
 const (
-	storeDirFlag   = "-store-dir="
-	testReadListen = "-read-listen=127.0.0.1:0"
+	storeDirFlag      = "-store-dir="
+	testReadListen    = "-read-listen=127.0.0.1:0"
+	testSessionListen = "-session-listen=127.0.0.1:0"
+	tokenFileFlag     = "-read-token-file="
 )
 
 func TestRunPrintsVersion(t *testing.T) {
@@ -57,9 +61,6 @@ func TestServeConfigErrors(t *testing.T) {
 		{errBodyCap, "large cap", []string{serveCommand, "-body-cap=6000000"}},
 		{errStoreLimit, "negative memory", []string{serveCommand, "-jetstream-max-memory=-1"}},
 		{errStoreLimit, "negative disk", []string{serveCommand, "-jetstream-max-store=-1"}},
-		{errReadFlags, "missing read token file flag", []string{serveCommand, testReadListen}},
-		{errReadFlags, "session without token file", []string{serveCommand, "-session-listen=127.0.0.1:0"}},
-		{errReadFlags, "empty read address", []string{serveCommand, "-read-listen=", "-read-token-file=tokens"}},
 		{os.ErrNotExist, "missing read token file", []string{serveCommand, testReadListen, "-read-token-file=missing"}},
 		{errServeFlags, "header without separator", []string{serveCommand, "-otlp-header=Authorization"}},
 		{errServeFlags, "empty header name", []string{serveCommand, "-otlp-header==value"}},
@@ -77,6 +78,132 @@ func TestServeConfigErrors(t *testing.T) {
 			err := run(t.Context(), io.Discard, slog.DiscardHandler, args)
 			checkEqual(t, errors.Is(err, test.err), true)
 		})
+	}
+}
+
+func TestServeTokenFlags(t *testing.T) {
+	t.Parallel()
+
+	const tokenFile = tokenFileFlag + "tokens"
+
+	for _, test := range []struct {
+		want error
+		args []string
+	}{
+		{nil, []string{testSessionListen, tokenFile}},
+		{nil, []string{testReadListen, tokenFile}},
+		{nil, []string{testSessionListen, testReadListen, tokenFile}},
+		{errReadFlags, []string{testSessionListen}},
+		{errReadFlags, []string{testReadListen}},
+		{errReadFlags, []string{tokenFile}},
+		{errReadFlags, []string{"-read-listen=", tokenFile}},
+		{errReadFlags, []string{"-read-listen=", testSessionListen, tokenFile}},
+	} {
+		var cfg serveConfig
+
+		err := cfg.parse(io.Discard, test.args)
+		if !errors.Is(err, test.want) {
+			t.Errorf("flags %v: got %v, want %v", test.args, err, test.want)
+		}
+	}
+}
+
+func TestServeSessionRejectsInvalidTokenFile(t *testing.T) {
+	t.Parallel()
+
+	file := filepath.Join(t.TempDir(), "tokens")
+	args := []string{
+		serveCommand, testSessionListen, tokenFileFlag + file, storeDirFlag, "-github-secret=" + fixtureKey,
+	}
+
+	for _, data := range []string{"", "# no entries\n", "reader:invalid\n"} {
+		checkError(t, os.WriteFile(file, []byte(data), 0o600))
+		checkEqual(t, errors.Is(run(t.Context(), io.Discard, slog.DiscardHandler, args), errTokenFormat), true)
+	}
+}
+
+func TestServeSessionOnly(t *testing.T) {
+	t.Parallel()
+
+	var listenConfig net.ListenConfig
+
+	listener, err := listenConfig.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	checkError(t, err)
+
+	address := listener.Addr().String()
+	checkError(t, listener.Close())
+
+	dir := t.TempDir()
+	file := filepath.Join(dir, "tokens")
+	writeReadTokens(t, file, "reader", readFixture)
+	args := []string{
+		serveCommand, "-listen=127.0.0.1:0", "-session-listen=" + address,
+		storeDirFlag + dir, tokenFileFlag + file, "-github-secret=" + fixtureKey,
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), shutdownTimeout)
+	done := make(chan error, 1)
+
+	go func() { done <- run(ctx, io.Discard, slog.DiscardHandler, args) }()
+
+	t.Cleanup(func() {
+		cancel()
+		checkError(t, <-done)
+	})
+
+	base := "http://" + address
+	checkServeSession(ctx, t, base, readFixture)
+
+	for _, test := range []struct {
+		path, bearer string
+		status       int
+	}{
+		{sessionPath, "Bearer invalid", http.StatusUnauthorized},
+		{sessionPath, "", http.StatusUnauthorized},
+		{eventsPath, "Bearer " + readFixture, http.StatusNotFound},
+	} {
+		req, requestErr := http.NewRequestWithContext(ctx, http.MethodGet, base+test.path, nil)
+		checkError(t, requestErr)
+
+		if test.bearer != "" {
+			req.Header.Set(authorization, test.bearer)
+		}
+
+		expectHTTPStatus(t, http.DefaultClient, req, test.status)
+	}
+
+	const replacement = "replacement-fixture"
+
+	writeReadTokens(t, file, "replacement", replacement)
+	checkServeSession(ctx, t, base, replacement)
+}
+
+func checkServeSession(ctx context.Context, t *testing.T, base, token string) {
+	t.Helper()
+
+	tick := time.NewTicker(25 * time.Millisecond)
+	defer tick.Stop()
+
+	options := new(websocket.DialOptions)
+	options.HTTPHeader = http.Header{authorization: {"Bearer " + token}}
+	options.Subprotocols = []string{sessionProtocol}
+
+	for {
+		//nolint:bodyclose // Dial owns the HTTP response body.
+		conn, _, err := websocket.Dial(ctx, base+sessionPath, options)
+		if err == nil {
+			//nolint:errcheck // The server may have already closed the socket.
+			defer conn.CloseNow()
+
+			checkSessionReply(ctx, t, conn, `{"type":"ping"}`, typeKey, pong)
+
+			return
+		}
+
+		select {
+		case <-ctx.Done():
+			t.Fatal("session did not accept the token before the deadline")
+		case <-tick.C:
+		}
 	}
 }
 
