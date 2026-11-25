@@ -39,6 +39,7 @@ func TestRunPrintsVersion(t *testing.T) {
 
 	err := run(t.Context(), writer, slog.DiscardHandler, nil)
 	checkEqual(t, errors.Is(err, io.ErrClosedPipe), true)
+	checkEqual(t, errors.Is(printParked(writer, strings.NewReader(`[{"seq":1}]`)), io.ErrClosedPipe), true)
 }
 
 func TestServeConfigErrors(t *testing.T) {

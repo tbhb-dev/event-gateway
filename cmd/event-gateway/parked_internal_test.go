@@ -10,11 +10,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
 	"net/http/httptest"
+	"os"
 	"reflect"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -213,6 +217,8 @@ func TestListParked(t *testing.T) {
 
 	ctx := t.Context()
 	store := testStore(t, retention)
+	api := parkedAPI{store: store}
+	callParked(t, api, http.MethodGet, parkedListPath, "", http.StatusServiceUnavailable)
 	stream := testParkedStream(t, store)
 	empty, listErr := listParked(ctx, stream, "", 0)
 	checkError(t, listErr)
@@ -221,7 +227,7 @@ func TestListParked(t *testing.T) {
 	const firstTarget = "one"
 
 	hook := parkHook(store.jet, newTelemetry(slog.DiscardHandler, nil, nil), 0)
-	for i, target := range []string{firstTarget, "two", firstTarget} {
+	for i, target := range []string{"two", firstTarget, firstTarget} {
 		hook(ctx, target, Event{Seq: uint64(i + 1)}, ErrPermanent)
 	}
 
@@ -230,7 +236,7 @@ func TestListParked(t *testing.T) {
 		want   []uint64
 		limit  int
 	}{
-		{target: firstTarget, want: []uint64{1, 3}},
+		{target: firstTarget, want: []uint64{2, 3}},
 		{want: []uint64{1, 2, 3}},
 		{limit: 2, want: []uint64{1, 2}},
 	} {
@@ -244,6 +250,17 @@ func TestListParked(t *testing.T) {
 		}
 	}
 
+	var filtered []parkedRecord
+
+	body := callParked(t, api, http.MethodGet, parkedListPath+"?target="+firstTarget+"&limit=1", "", http.StatusOK)
+	checkError(t, json.Unmarshal([]byte(body), &filtered))
+	checkEqual(t, len(filtered), 1)
+	checkEqual(t, filtered[0].Seq, uint64(2))
+
+	for _, query := range []string{"?limit=no", "?limit=-1"} {
+		callParked(t, api, http.MethodGet, parkedListPath+query, "", http.StatusBadRequest)
+	}
+
 	_, err := listParked(ctx, stream, "", -1)
 	checkEqual(t, errors.Is(err, errParkedLimit), true)
 	_, err = listParked(ctx, parkedPullStream{Stream: stream}, "", 0)
@@ -251,6 +268,8 @@ func TestListParked(t *testing.T) {
 	_, err = store.jet.Publish(ctx, "parked.one", []byte("invalid JSON"))
 	checkError(t, err)
 	_, err = listParked(ctx, stream, "", 0)
+
+	callParked(t, api, http.MethodGet, parkedListPath, "", http.StatusServiceUnavailable)
 
 	var syntax *json.SyntaxError
 
@@ -299,6 +318,7 @@ func TestRetryParked(t *testing.T) {
 		{seq: 2, calls: 1},
 		{seq: 2, calls: 1, deliveryErr: errRetryDelivery, want: errRetryDelivery},
 		{seq: 2, calls: 1, panics: true, want: ErrPermanent},
+		{seq: 2, calls: 1, deliveryErr: fmt.Errorf("%w: %s", ErrPermanent, parkedPayloadFixture), want: ErrPermanent},
 		{seq: 1, want: jetstream.ErrMsgNotFound},
 		{seq: 3, want: jetstream.ErrMsgNotFound},
 	} {
@@ -318,9 +338,88 @@ func TestRetryParked(t *testing.T) {
 		err := retryParked(ctx, store, target, test.seq)
 		checkEqual(t, errors.Is(err, test.want), true)
 		checkEqual(t, calls, test.calls)
+
+		api := parkedAPI{store: store, targets: []runnerTarget{{Target: target}}}
+		body := fmt.Sprintf(`{"target":%q,"seq":%d}`, target.name, test.seq)
+
+		status, wantBody := http.StatusInternalServerError, "retry failed\n"
+		if test.want == nil {
+			status, wantBody = http.StatusNoContent, ""
+		}
+
+		checkEqual(t, callParked(t, api, http.MethodPost, parkedRetryPath, body, status), wantBody)
+		checkEqual(t, calls, 2*test.calls)
 	}
+
+	api := parkedAPI{store: store, targets: []runnerTarget{{Target: fakeTarget{name: "present"}}}}
+	for _, body := range []string{"{", `{}`, `{"target":"retry"}`, `{"target":"retry","seq":1}[]`} {
+		callParked(t, api, http.MethodPost, parkedRetryPath, body, http.StatusBadRequest)
+	}
+
+	callParked(t, api, http.MethodPost, parkedRetryPath, `{"target":"missing","seq":2}`, http.StatusNotFound)
 
 	info, err := stream.Info(ctx)
 	checkError(t, err)
 	checkEqual(t, info.State.Msgs, uint64(1))
+}
+
+func callParked(t *testing.T, api parkedAPI, method, path, body string, status int) string {
+	t.Helper()
+
+	response := httptest.NewRecorder()
+	api.handler().
+		ServeHTTP(response, httptest.NewRequestWithContext(t.Context(), method, path, strings.NewReader(body)))
+	checkEqual(t, response.Code, status)
+
+	return response.Body.String()
+}
+
+func TestParkedCLI(t *testing.T) {
+	t.Setenv(parkedSocketEnv, "from-env.sock")
+	ctx := t.Context()
+
+	for _, args := range [][]string{
+		nil,
+		{"other"},
+		{parkedListCommand, "-bad"},
+		{parkedListCommand, "extra-arg"},
+		{parkedRetryCommand, "-bad"},
+		{parkedRetryCommand, "target"},
+		{parkedRetryCommand, "target", "invalid"},
+	} {
+		err := run(ctx, io.Discard, slog.DiscardHandler, append([]string{parkedCommand}, args...))
+		checkEqual(t, err, errParkedUsage)
+	}
+
+	for _, transport := range []error{os.ErrNotExist, syscall.ECONNREFUSED} {
+		err := parkedResponse(io.Discard, "missing.sock", nil, transport)
+		checkEqual(t, err.Error(), "event-gateway is not running (cannot reach missing.sock)")
+		checkEqual(t, exitCode(ctx, slog.New(slog.DiscardHandler), err), 1)
+	}
+
+	response := &http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody}
+
+	checkError(t, runParked(ctx, io.Discard, []string{parkedRetryCommand, "sample", "3"},
+		func(string, *http.Request) (*http.Response, error) { return response, nil }))
+
+	response.StatusCode = http.StatusNotFound
+	checkEqual(t, errors.Is(parkedResponse(io.Discard, "", response, nil), errParkedRequest), true)
+	checkEqual(t, printParked(io.Discard, strings.NewReader("invalid")), errParkedRequest)
+
+	checkEqual(t, parkedResponse(io.Discard, "", nil, os.ErrPermission), errParkedRequest)
+
+	const record = `{"target":"sample","rule":"select","provider":"github","event":"push",` +
+		`"delivery":"fixture","error":"failed","parked_at":"2026-11-24T00:00:00Z","seq":3}`
+
+	var out bytes.Buffer
+
+	args := []string{parkedListCommand, "-target=sample", "-limit=1"}
+	err := runParked(ctx, &out, args, func(path string, req *http.Request) (*http.Response, error) {
+		checkEqual(t, path, "from-env.sock")
+		checkEqual(t, req.URL.RequestURI(), parkedListPath+"?limit=1&target=sample")
+
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("[" + record + "]"))}, nil
+	})
+	checkError(t, err)
+	checkEqual(t, out.String(), record+"\n")
 }
