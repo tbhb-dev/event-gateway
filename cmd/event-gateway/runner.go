@@ -52,6 +52,7 @@ type runnerTarget struct {
 
 	Start    startPosition
 	Subjects []string
+	Rules    int
 }
 
 type runner struct {

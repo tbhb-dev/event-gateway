@@ -276,7 +276,7 @@ func TestGitHubIngestEvent(t *testing.T) {
 		{oversizeBody, "transport limit", issuesEvent, "1", issuesEvent, http.StatusRequestEntityTooLarge},
 		{nil, "missing delivery", issuesEvent, "", issuesEvent, http.StatusBadRequest},
 		{nil, "malformed event", "Issues", "1", "", http.StatusBadRequest},
-		{nil, "accepted", issuesEvent, "ingest-event", issuesEvent, http.StatusAccepted},
+		{nil, outcomeAccepted, issuesEvent, "ingest-event", issuesEvent, http.StatusAccepted},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
@@ -286,7 +286,7 @@ func TestGitHubIngestEvent(t *testing.T) {
 				test.edit(req)
 			}
 
-			event, status := hook.ingest(httptest.NewRecorder(), req)
+			event, _, status, _ := hook.ingest(httptest.NewRecorder(), req)
 			checkEqual(t, event, test.want)
 			checkEqual(t, status, test.status)
 		})
@@ -370,4 +370,109 @@ func TestNewTelemetryNilProviders(t *testing.T) {
 		bodyCap:   defaultBodyCap,
 	}
 	expectStatus(t, hook.ServeHTTP, signedRequest(t.Context(), issuesEvent, "1", "{}"), http.StatusAccepted)
+}
+
+type webhookLog struct {
+	Repository *string `json:"repository"`
+	Level      string  `json:"level"`
+	Msg        string  `json:"msg"`
+	Provider   string  `json:"provider"`
+	Event      string  `json:"event"`
+	Delivery   string  `json:"delivery"`
+	Outcome    string  `json:"outcome"`
+	Reason     string  `json:"reason"`
+	Status     int     `json:"status"`
+}
+
+func readWebhookLog(t *testing.T, output string) webhookLog {
+	t.Helper()
+
+	var matches []webhookLog
+
+	for line := range strings.SplitSeq(strings.TrimSpace(output), "\n") {
+		var entry webhookLog
+		checkError(t, json.Unmarshal([]byte(line), &entry))
+
+		if entry.Msg == "webhook received" {
+			matches = append(matches, entry)
+		}
+	}
+
+	checkEqual(t, len(matches), 1)
+	checkEqual(t, matches[0].Level, "INFO")
+
+	return matches[0]
+}
+
+func TestGitHubWebhookLogging(t *testing.T) {
+	t.Parallel()
+
+	const body = `{"repository":{"full_name":"example/repository"},"secret":"github-body-secret-fixture"}`
+
+	var logs bytes.Buffer
+
+	hook := &githubWebhook{
+		store:     testStore(t, retention),
+		telemetry: newTelemetry(slog.NewJSONHandler(&logs, nil), nil, nil),
+		secret:    []byte(fixtureKey),
+		bodyCap:   defaultBodyCap,
+	}
+
+	ctx := t.Context()
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+
+	rawDelivery := "bad-\n\x00\x1f\x7f-" + strings.Repeat("d", 70)
+	sanitizedDelivery := "bad-____-" + strings.Repeat("d", 55)
+	badSig := signedRequest(ctx, issuesEvent, rawDelivery, body)
+	badSig.Header.Set("X-Hub-Signature-256", "sha256="+strings.Repeat("a", sha256.Size*2))
+
+	oversized := signedRequest(ctx, issuesEvent, "delivery-3", body)
+	oversizeBody(oversized)
+
+	repo := "example/repository"
+
+	for _, test := range []struct {
+		req      *http.Request
+		repo     *string
+		delivery string
+		outcome  string
+		reason   string
+		status   int
+	}{
+		{
+			signedRequest(ctx, issuesEvent, "delivery-1", body),
+			&repo, "delivery-1", outcomeAccepted, "", http.StatusAccepted,
+		},
+		{
+			signedRequest(ctx, issuesEvent, "delivery-1", body),
+			&repo, "delivery-1", outcomeDuplicate, "", http.StatusAccepted,
+		},
+		{badSig, nil, sanitizedDelivery, outcomeRejected, "bad_signature", http.StatusUnauthorized},
+		{oversized, nil, "delivery-3", outcomeRejected, "size_cap", http.StatusRequestEntityTooLarge},
+		{
+			signedRequest(canceled, issuesEvent, "delivery-4", body),
+			&repo, "delivery-4", outcomeRejected, "store_unavailable", http.StatusServiceUnavailable,
+		},
+	} {
+		logs.Reset()
+
+		sig := strings.TrimPrefix(test.req.Header.Get("X-Hub-Signature-256"), "sha256=")
+		expectStatus(t, hook.ServeHTTP, test.req, test.status)
+
+		output := logs.String()
+		for _, forbidden := range []string{"github-body-secret-fixture", sig, rawDelivery} {
+			checkEqual(t, strings.Contains(output, forbidden), false)
+		}
+
+		entry := readWebhookLog(t, output)
+		checkEqual(t, entry.Provider, "github")
+		checkEqual(t, entry.Event, issuesEvent)
+		checkEqual(t, entry.Delivery, test.delivery)
+		checkEqual(t, len(entry.Delivery) <= logFieldCap, true)
+		checkEqual(t, entry.Status, test.status)
+		checkEqual(t, entry.Outcome, test.outcome)
+		checkEqual(t, entry.Reason, test.reason)
+		checkEqual(t, reflect.DeepEqual(entry.Repository, test.repo), true)
+	}
 }

@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -13,6 +14,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -173,5 +175,55 @@ func TestGrafanaWebhookRequiresSecret(t *testing.T) {
 	for _, secret := range [][]byte{nil, {}, []byte(" \t\n")} {
 		_, err := newGrafanaWebhook(secret)
 		checkEqual(t, errors.Is(err, errGrafanaSecret), true)
+	}
+}
+
+func TestGrafanaWebhookLogging(t *testing.T) {
+	t.Parallel()
+
+	var logs bytes.Buffer
+
+	hook, _ := grafanaHook(t)
+	hook.telemetry = newTelemetry(slog.NewJSONHandler(&logs, nil), nil, nil)
+
+	ctx := t.Context()
+	body := alertsBody(hostAlert)
+	delivery := grafanaDelivery([]byte(body), 0)
+	repo := "hosts/web-1"
+
+	badSig := grafanaSigned(ctx, body)
+	badSig.Header.Set(grafanaSignature, zeroDigest)
+
+	for _, test := range []struct {
+		req      *http.Request
+		repo     *string
+		event    string
+		delivery string
+		outcome  string
+		reason   string
+		status   int
+	}{
+		{grafanaSigned(ctx, body), &repo, "alert.firing", delivery, outcomeAccepted, "", http.StatusAccepted},
+		{grafanaSigned(ctx, body), &repo, "alert.firing", delivery, outcomeDuplicate, "", http.StatusAccepted},
+		{badSig, nil, "alert", "", outcomeRejected, "bad_signature", http.StatusUnauthorized},
+	} {
+		logs.Reset()
+
+		sig := test.req.Header.Get(grafanaSignature)
+		expectStatus(t, hook.ServeHTTP, test.req, test.status)
+
+		output := logs.String()
+		for _, forbidden := range []string{"hidden", sig} {
+			checkEqual(t, strings.Contains(output, forbidden), false)
+		}
+
+		entry := readWebhookLog(t, output)
+		checkEqual(t, entry.Provider, grafanaProvider)
+		checkEqual(t, entry.Event, test.event)
+		checkEqual(t, entry.Delivery, test.delivery)
+		checkEqual(t, entry.Status, test.status)
+		checkEqual(t, entry.Outcome, test.outcome)
+		checkEqual(t, entry.Reason, test.reason)
+		checkEqual(t, reflect.DeepEqual(entry.Repository, test.repo), true)
 	}
 }

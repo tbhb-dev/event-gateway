@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -96,35 +97,38 @@ func (h *grafanaWebhook) ServeHTTP(response http.ResponseWriter, request *http.R
 	ctx, span := h.telemetry.tracer.Start(request.Context(), "grafana webhook")
 	defer span.End()
 
-	status := h.ingest(response, request.WithContext(ctx))
+	meta, status, duplicate := h.ingest(response, request.WithContext(ctx))
 	h.telemetry.record(ctx, span, "alert", status)
+	h.telemetry.logWebhook(ctx, meta, status, duplicate)
 	response.WriteHeader(status)
 }
 
-func (h *grafanaWebhook) ingest(response http.ResponseWriter, request *http.Request) int {
+func (h *grafanaWebhook) ingest(response http.ResponseWriter, request *http.Request) (envelope, int, bool) {
 	receivedAt := time.Now().UTC()
+	//nolint:exhaustruct_v5 // The log record uses only the provider, event, delivery and repository fields.
+	meta := envelope{Provider: grafanaProvider, Event: "alert"}
 
 	if request.ContentLength > grafanaBodyCap {
-		return http.StatusRequestEntityTooLarge
+		return meta, http.StatusRequestEntityTooLarge, false
 	}
 
 	// The decoder accepts either hex case and rejects any other character.
 	digest, err := hex.DecodeString(request.Header.Get(grafanaSignature))
 	if err != nil || len(digest) != sha256.Size {
-		return http.StatusUnauthorized
+		return meta, http.StatusUnauthorized, false
 	}
 
 	body, err := io.ReadAll(http.MaxBytesReader(response, request.Body, grafanaBodyCap))
 	if _, tooLarge := errors.AsType[*http.MaxBytesError](err); tooLarge {
-		return http.StatusRequestEntityTooLarge
+		return meta, http.StatusRequestEntityTooLarge, false
 	}
 
 	if err != nil {
-		return http.StatusBadRequest
+		return meta, http.StatusBadRequest, false
 	}
 
 	if !verifySignature(h.secret, body, digest) {
-		return http.StatusUnauthorized
+		return meta, http.StatusUnauthorized, false
 	}
 
 	var alerts struct {
@@ -133,30 +137,42 @@ func (h *grafanaWebhook) ingest(response http.ResponseWriter, request *http.Requ
 
 	err = json.Unmarshal(body, &alerts)
 	if err != nil || len(alerts.Alerts) == 0 || len(alerts.Alerts) > grafanaMaxAlerts {
-		return http.StatusBadRequest
+		return meta, http.StatusBadRequest, false
 	}
 
-	for index, raw := range alerts.Alerts {
+	return h.publishAlerts(request.Context(), body, alerts.Alerts, receivedAt, meta)
+}
+
+func (h *grafanaWebhook) publishAlerts(
+	ctx context.Context, body []byte, rawAlerts []json.RawMessage, receivedAt time.Time, meta envelope,
+) (envelope, int, bool) {
+	duplicate := false
+
+	for index, raw := range rawAlerts {
 		message, skip := normalizeGrafana(raw, grafanaDelivery(body, index), receivedAt)
 		if skip != nil {
 			continue
 		}
 
-		err = h.store.publish(request.Context(), message)
-		if errors.Is(err, errBodyConflict) {
-			h.telemetry.logger.WarnContext(request.Context(), "Grafana delivery already has a different body")
+		meta = message
 
-			return http.StatusConflict
-		}
+		err := h.store.publish(ctx, message)
+		switch {
+		case err == nil:
+		case errors.Is(err, errDuplicate):
+			duplicate = true
+		case errors.Is(err, errBodyConflict):
+			h.telemetry.logger.WarnContext(ctx, "Grafana delivery already has a different body")
 
-		if err != nil {
-			h.telemetry.logger.ErrorContext(request.Context(), "Grafana event storage unavailable")
+			return meta, http.StatusConflict, false
+		default:
+			h.telemetry.logger.ErrorContext(ctx, "Grafana event storage unavailable")
 
-			return http.StatusServiceUnavailable
+			return meta, http.StatusServiceUnavailable, false
 		}
 	}
 
-	return http.StatusAccepted
+	return meta, http.StatusAccepted, duplicate
 }
 
 // grafanaDelivery names an alert by the body and its position, so a retried

@@ -33,6 +33,7 @@ var (
 	errInvalidEvent = errors.New("event name must be a single subject token without wildcards or whitespace")
 	errEmptyPayload = errors.New("event payload must not be empty")
 	errBodyConflict = errors.New("delivery ID already has a different body")
+	errDuplicate    = errors.New("duplicate delivery")
 )
 
 type eventStore struct {
@@ -217,5 +218,5 @@ func (s eventStore) publishChecked(ctx context.Context, msg *nats.Msg, hash stri
 		return errBodyConflict
 	}
 
-	return nil
+	return errDuplicate
 }

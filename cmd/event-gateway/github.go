@@ -147,8 +147,9 @@ func (h *githubWebhook) receive(response http.ResponseWriter, request *http.Requ
 	ctx, span := h.telemetry.tracer.Start(request.Context(), "github webhook")
 	defer span.End()
 
-	event, status := h.ingest(response, request.WithContext(ctx))
+	event, meta, status, duplicate := h.ingest(response, request.WithContext(ctx))
 	h.telemetry.record(ctx, span, event, status)
+	h.telemetry.logWebhook(ctx, meta, status, duplicate)
 
 	if status == http.StatusRequestEntityTooLarge {
 		http.Error(response, "GitHub webhook body exceeds the store limit", status)
@@ -159,64 +160,69 @@ func (h *githubWebhook) receive(response http.ResponseWriter, request *http.Requ
 	response.WriteHeader(status)
 }
 
-func (h *githubWebhook) ingest(response http.ResponseWriter, request *http.Request) (string, int) {
+func (h *githubWebhook) ingest(
+	response http.ResponseWriter, request *http.Request,
+) (string, envelope, int, bool) {
 	receivedAt := time.Now().UTC()
 	signature := request.Header.Get("X-Hub-Signature-256")
+	rawEvent := request.Header.Get(eventHeader)
+	delivery := request.Header.Get(deliveryHeader)
 
 	// The signature covers the body, not the headers, so only a well-formed
 	// event name is recorded.
-	event := request.Header.Get(eventHeader)
+	event := rawEvent
 	if !githubEvent.MatchString(event) {
 		event = ""
 	}
 
+	//nolint:exhaustruct_v5 // The log record uses only the provider, event, delivery and repository fields.
+	meta := envelope{Provider: "github", Event: rawEvent, Delivery: delivery}
+
 	digest, err := decodeSignature(signature)
 	if err != nil {
-		return "", http.StatusUnauthorized
+		return "", meta, http.StatusUnauthorized, false
 	}
 
 	body, err := io.ReadAll(http.MaxBytesReader(response, request.Body, maxPayload))
 	if err != nil {
 		_, tooLarge := errors.AsType[*http.MaxBytesError](err)
 		if tooLarge {
-			return event, http.StatusRequestEntityTooLarge
+			return event, meta, http.StatusRequestEntityTooLarge, false
 		}
 
-		return event, http.StatusBadRequest
+		return event, meta, http.StatusBadRequest, false
 	}
 
 	if !verifySignature(h.secret, body, digest) {
-		return "", http.StatusUnauthorized
+		return "", meta, http.StatusUnauthorized, false
 	}
-
-	delivery := request.Header.Get(deliveryHeader)
 
 	err = validateEvent(event, body)
 	if err != nil {
-		return event, h.publishStatus(request.Context(), err)
+		return event, meta, h.publishStatus(request.Context(), err), false
 	}
 
 	if !githubDelivery.MatchString(delivery) {
-		return event, http.StatusBadRequest
+		return event, meta, http.StatusBadRequest, false
 	}
 
 	normalized, err := normalizeGitHub(event, delivery, receivedAt, body, h.bodyCap)
 	if err != nil {
-		return event, http.StatusBadRequest
+		return event, meta, http.StatusBadRequest, false
 	}
 
 	if event == "ping" {
-		return event, http.StatusAccepted
+		return event, normalized, http.StatusAccepted, false
 	}
 
 	err = h.store.publish(request.Context(), normalized)
 
-	return event, h.publishStatus(request.Context(), err)
+	return event, normalized, h.publishStatus(request.Context(), err), errors.Is(err, errDuplicate)
 }
 
 func (h *githubWebhook) publishStatus(ctx context.Context, err error) int {
 	switch {
-	case err == nil:
+	case err == nil, errors.Is(err, errDuplicate):
 		return http.StatusAccepted
 	case errors.Is(err, errInvalidEvent), errors.Is(err, errEmptyPayload):
 		return http.StatusBadRequest

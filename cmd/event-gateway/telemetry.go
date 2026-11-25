@@ -6,6 +6,8 @@ package main
 import (
 	"context"
 	"log/slog"
+	"net/http"
+	"regexp"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
@@ -15,7 +17,15 @@ import (
 	tracenoop "go.opentelemetry.io/otel/trace/noop"
 )
 
-const serviceName = "event-gateway"
+const (
+	serviceName      = "event-gateway"
+	logFieldCap      = 64
+	outcomeAccepted  = "accepted"
+	outcomeDuplicate = "duplicate"
+	outcomeRejected  = "rejected"
+)
+
+var nonPrintable = regexp.MustCompile(`[^\x20-\x7e]`)
 
 // telemetry carries the logger, tracer and counters the gateway records to.
 // The caller supplies the providers, so nothing here reads the environment.
@@ -64,4 +74,48 @@ func (t telemetry) record(ctx context.Context, span trace.Span, event string, st
 	}
 	span.SetAttributes(attrs...)
 	t.ingest.Add(ctx, 1, metric.WithAttributes(attrs...))
+}
+
+func (t telemetry) logWebhook(ctx context.Context, meta envelope, status int, duplicate bool) {
+	outcome, reason := outcomeAccepted, ""
+	if status != http.StatusAccepted {
+		outcome, reason = outcomeRejected, rejectReason(status)
+	} else if duplicate {
+		outcome = outcomeDuplicate
+	}
+
+	attrs := []slog.Attr{
+		slog.String("provider", meta.Provider),
+		slog.String("event", sanitizeLog(meta.Event)),
+		slog.String("delivery", sanitizeLog(meta.Delivery)),
+	}
+	if meta.Repository != nil {
+		attrs = append(attrs, slog.String("repository", sanitizeLog(*meta.Repository)))
+	}
+
+	attrs = append(attrs, slog.Int("status", status), slog.String("outcome", outcome))
+	if reason != "" {
+		attrs = append(attrs, slog.String("reason", reason))
+	}
+
+	t.logger.LogAttrs(ctx, slog.LevelInfo, "webhook received", attrs...)
+}
+
+func sanitizeLog(value string) string {
+	return nonPrintable.ReplaceAllLiteralString(value[:min(len(value), logFieldCap)], "_")
+}
+
+func rejectReason(status int) string {
+	switch status {
+	case http.StatusUnauthorized:
+		return "bad_signature"
+	case http.StatusRequestEntityTooLarge:
+		return "size_cap"
+	case http.StatusConflict:
+		return "body_conflict"
+	case http.StatusServiceUnavailable:
+		return "store_unavailable"
+	default:
+		return "bad_body"
+	}
 }

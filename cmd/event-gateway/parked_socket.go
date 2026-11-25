@@ -37,7 +37,7 @@ func (cfg *serveConfig) withParked(ctx context.Context, targets []runnerTarget, 
 
 	return run(func(store eventStore) []httpService {
 		server := gatewayHTTP("", parkedAPI{store: store, targets: targets}.handler())
-		server.serve = func() error { return server.Serve(listener) }
+		server.listen = func(context.Context) (net.Listener, error) { return listener, nil }
 
 		return []httpService{server}
 	})
