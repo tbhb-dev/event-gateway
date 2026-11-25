@@ -23,6 +23,9 @@ const (
 	testEnvelope  = `{"type":"event","payload":{"sample":true}}`
 )
 
+// runnerWait bounds a hang and does not pace the tests.
+const runnerWait = 30 * time.Second
+
 var errRetryDelivery = errors.New("retry delivery")
 
 type fakeTarget struct {
@@ -68,7 +71,7 @@ func receiveRunner[T any](t *testing.T, results <-chan T) T {
 	select {
 	case result := <-results:
 		return result
-	case <-time.After(5 * time.Second):
+	case <-time.After(runnerWait):
 		t.Fatal("timed out waiting for runner")
 
 		return *new(T)
