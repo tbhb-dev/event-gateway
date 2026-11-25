@@ -4,11 +4,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"os"
 	"reflect"
 	"slices"
 	"strings"
@@ -54,21 +57,92 @@ func runMCP(ctx context.Context, logHandler slog.Handler, args []string) error {
 		return errMCPUsage
 	}
 
-	notifier := &notifyingTransport{inner: &mcp.StdioTransport{MaxLineLength: 0}, conn: nil, mu: sync.Mutex{}}
+	return serveMCP(ctx, logHandler, os.Stdin, os.Stdout)
+}
+
+func serveMCP(ctx context.Context, logHandler slog.Handler, stdin io.ReadCloser, stdout io.Writer) error {
+	defer stdin.Close()
+
 	logger := slog.New(logHandler)
 	subs := loadMCPSubscriptions(ctx, logger)
 
-	initialized, stopGateway := startMCPGateway(ctx, subs, notifier, logger)
+	runCtx, cancel := context.WithCancel(ctx)
+	transport := &mcp.IOTransport{
+		Reader:        mcpStdin{Reader: stdin, cancel: cancel},
+		Writer:        mcpStdout{writer: stdout, done: runCtx.Done()},
+		MaxLineLength: 0,
+	}
+	notifier := &notifyingTransport{inner: transport, conn: nil, mu: sync.Mutex{}}
+	initialized, stopGateway := startMCPGateway(runCtx, subs, notifier, logger)
+
 	defer stopGateway()
 
 	server := newMCPServer(logger, subs, notifier, initialized)
 
+	// Let the SDK handle EOF and report any transport error.
 	err := server.Run(ctx, notifier)
+
+	cancel() // Release blocked notification writes before waiting for the gateway worker.
+
 	if err != nil {
 		return fmt.Errorf("serve MCP: %w", err)
 	}
 
 	return nil
+}
+
+type mcpStdin struct {
+	io.Reader
+
+	cancel context.CancelFunc
+}
+
+// serveMCP closes stdin after the SDK returns so shutdown cannot mask a write error with a read error.
+func (mcpStdin) Close() error { return nil }
+
+func (in mcpStdin) Read(p []byte) (int, error) {
+	n, err := in.Reader.Read(p)
+	if errors.Is(err, io.EOF) {
+		in.cancel()
+	}
+
+	return n, err //nolint:wrapcheck // Preserve the stdin read result for the SDK.
+}
+
+type mcpStdout struct {
+	writer io.Writer
+	done   <-chan struct{}
+}
+
+func (mcpStdout) Close() error { return nil }
+
+func (out mcpStdout) Write(data []byte) (int, error) {
+	select {
+	case <-out.done:
+		return 0, io.ErrClosedPipe
+	default:
+	}
+
+	type result struct {
+		err error
+		n   int
+	}
+
+	written := make(chan result, 1)
+	payload := bytes.Clone(data)
+
+	// An inherited stdout pipe that never drains can hold this goroutine until process exit.
+	go func() {
+		n, err := out.writer.Write(payload)
+		written <- result{err: err, n: n}
+	}()
+
+	select {
+	case <-out.done:
+		return 0, io.ErrClosedPipe
+	case got := <-written:
+		return got.n, got.err
+	}
 }
 
 func newMCPServer(
