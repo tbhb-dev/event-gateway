@@ -57,6 +57,7 @@ func TestServeConfigErrors(t *testing.T) {
 		{errStoreLimit, "negative memory", []string{serveCommand, "-jetstream-max-memory=-1"}},
 		{errStoreLimit, "negative disk", []string{serveCommand, "-jetstream-max-store=-1"}},
 		{errReadFlags, "missing read token file flag", []string{serveCommand, testReadListen}},
+		{errReadFlags, "session without token file", []string{serveCommand, "-session-listen=127.0.0.1:0"}},
 		{errReadFlags, "empty read address", []string{serveCommand, "-read-listen=", "-read-token-file=tokens"}},
 		{os.ErrNotExist, "missing read token file", []string{serveCommand, testReadListen, "-read-token-file=missing"}},
 		{errServeFlags, "header without separator", []string{serveCommand, "-otlp-header=Authorization"}},
@@ -172,7 +173,7 @@ func TestServeValidSecretAndContextShutdown(t *testing.T) {
 	checkEqual(t, exports.Load(), 0)
 
 	exerciseServe(t, file, http.StatusUnauthorized, "-grafana-secret-file="+file,
-		"-otlp-endpoint="+collector.URL, "-otlp-header=X-Collector-Test=test=value")
+		"-otlp-endpoint="+collector.URL, "-otlp-header=X-Collector-Test=test=value", "-session-listen=127.0.0.1:0")
 	checkEqual(t, exports.Load() > 0, true)
 	checkEqual(t, sentHeader.Load(), true)
 }

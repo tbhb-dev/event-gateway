@@ -44,6 +44,7 @@ type serveConfig struct {
 	grafSecret *string
 	grafFile   *string
 	readListen string
+	wsListen   string
 	tokenFile  string
 	listen     string
 	storeDir   string
@@ -58,6 +59,7 @@ func (cfg *serveConfig) parse(out io.Writer, args []string) error {
 	flags.SetOutput(io.Discard)
 	flags.StringVar(&cfg.listen, "listen", "127.0.0.1:8080", "HTTP listen address")
 	flags.StringVar(&cfg.readListen, readListenFlag, "", "private read API listen address")
+	flags.StringVar(&cfg.wsListen, "session-listen", "", "private session listen address")
 	flags.StringVar(&cfg.tokenFile, readTokenFileFlag, "", "read API bearer token hash file")
 	flags.StringVar(&cfg.storeDir, "store-dir", "/data/nats", "JetStream data directory")
 	flags.Func("github-secret", "GitHub webhook secret (overrides file and environment)", func(value string) error {
@@ -123,7 +125,8 @@ func (cfg *serveConfig) parse(out io.Writer, args []string) error {
 		return errBodyCap
 	case cfg.maxMemory < 0, cfg.maxStore < 0:
 		return errStoreLimit
-	case provided[readListenFlag] != provided[readTokenFileFlag], provided[readListenFlag] && cfg.readListen == "":
+	case cfg.wsListen != "" && !provided[readTokenFileFlag],
+		provided[readListenFlag] != provided[readTokenFileFlag], provided[readListenFlag] && cfg.readListen == "":
 		return errReadFlags
 	default:
 		return nil
@@ -215,7 +218,17 @@ func serve(ctx context.Context, out io.Writer, logHandler slog.Handler, args []s
 	}
 
 	api := readAPI{tokens: &tokens, store: store, telemetry: signals}
+
 	reader := gatewayHTTP(cfg.readListen, api.handler())
+	if cfg.wsListen != "" {
+		sessions := newSessionAPI(api, helloTimeout)
+		server := gatewayHTTP(cfg.wsListen, http.HandlerFunc(sessions.connect))
+		server.RegisterOnShutdown(func() { close(sessions.stop) })
+
+		defer sessions.active.Wait()
+
+		return runHTTP(ctx, &tokens, signals.logger, webhook, reader, server)
+	}
 
 	return runHTTP(ctx, &tokens, signals.logger, webhook, reader)
 }
