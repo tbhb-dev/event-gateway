@@ -201,30 +201,33 @@ func TestRunnerRestart(t *testing.T) {
 func TestRunnerGap(t *testing.T) {
 	t.Parallel()
 
-	store := testStore(t, time.Second)
+	store := testStore(t, retention)
 
 	events := make(chan Event, 4)
-	ready := make(chan struct{})
-	run := &runner{stream: store.stream, ready: ready, targets: []runnerTarget{{
+	run := &runner{stream: store.stream, targets: []runnerTarget{{
 		Target: recordingTarget("gap", events), Start: startPosition{all: true},
 	}}}
 	stop := startRunner(t, run)
 
-	// Publish only once the consumer exists so a slow start cannot outlive the stream's expiry.
-	receiveRunner(t, ready)
 	publishRunner(t, store, pullSubject)
 	expectRunner(t, events, 1)
 	stop()
 
-	// The runner closes ready once, so the restart must not reuse it.
-	run.ready = nil
+	// Shorten the expiry only now so the first delivery cannot race it.
+	info, err := store.stream.Info(t.Context())
+	checkError(t, err)
+
+	config := info.Config
+	config.MaxAge, config.Duplicates = time.Second, time.Second
+	_, err = store.jet.UpdateStream(t.Context(), config)
+	checkError(t, err)
 
 	publishRunner(t, store, pullSubject)
 	waitRunner(t, func() bool {
-		info, err := store.stream.Info(t.Context())
-		checkError(t, err)
+		current, infoErr := store.stream.Info(t.Context())
+		checkError(t, infoErr)
 
-		return info.State.FirstSeq == 3
+		return current.State.FirstSeq == 3
 	})
 
 	stop = startRunner(t, run)
