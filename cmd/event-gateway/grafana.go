@@ -162,12 +162,8 @@ func (h *grafanaWebhook) publishAlerts(
 		case errors.Is(err, errDuplicate):
 			duplicate = true
 		case errors.Is(err, errBodyConflict):
-			h.telemetry.logger.WarnContext(ctx, "Grafana delivery already has a different body")
-
 			return meta, http.StatusConflict, false
 		default:
-			h.telemetry.logger.ErrorContext(ctx, "Grafana event storage unavailable")
-
 			return meta, http.StatusServiceUnavailable, false
 		}
 	}

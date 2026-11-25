@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"flag"
@@ -283,6 +284,11 @@ type parkedService func(eventStore) []httpService
 
 func noParkedService(eventStore) []httpService { return nil }
 
+//nolint:gochecknoglobals // Tests substitute a listener without a port race.
+var listenTCP = func(ctx context.Context, address string) (net.Listener, error) {
+	return new(net.ListenConfig).Listen(ctx, "tcp", address)
+}
+
 func gatewayHTTP(address string, handler http.Handler) httpService {
 	//nolint:exhaustruct_v5 // The gateway sets the address, handler, and timeouts it needs.
 	server := &http.Server{
@@ -297,7 +303,7 @@ func gatewayHTTP(address string, handler http.Handler) httpService {
 	return httpService{
 		Server: server,
 		listen: func(ctx context.Context) (net.Listener, error) {
-			return new(net.ListenConfig).Listen(ctx, "tcp", address)
+			return listenTCP(ctx, cmp.Or(address, ":http"))
 		},
 	}
 }
@@ -376,10 +382,10 @@ func runHTTPServer(ctx context.Context, httpServer *http.Server, listener net.Li
 		done <- errors.Join(httpServer.Shutdown(shutdown), httpServer.Close())
 	})
 
-	defer stop()
-
-	//nolint:errcheck // Shutdown closes the listener and reports errors through done.
-	_ = httpServer.Serve(listener)
+	err := httpServer.Serve(listener)
+	if stop() {
+		return fmt.Errorf("serve HTTP: %w", err)
+	}
 
 	return <-done
 }

@@ -76,10 +76,12 @@ func (t telemetry) record(ctx context.Context, span trace.Span, event string, st
 	t.ingest.Add(ctx, 1, metric.WithAttributes(attrs...))
 }
 
+// logWebhook emits one record per POST to an enabled webhook route.
 func (t telemetry) logWebhook(ctx context.Context, meta envelope, status int, duplicate bool) {
-	outcome, reason := outcomeAccepted, ""
+	level, outcome, reason := slog.LevelInfo, outcomeAccepted, ""
 	if status != http.StatusAccepted {
-		outcome, reason = outcomeRejected, rejectReason(status)
+		level, reason = rejectLog(status)
+		outcome = outcomeRejected
 	} else if duplicate {
 		outcome = outcomeDuplicate
 	}
@@ -98,24 +100,24 @@ func (t telemetry) logWebhook(ctx context.Context, meta envelope, status int, du
 		attrs = append(attrs, slog.String("reason", reason))
 	}
 
-	t.logger.LogAttrs(ctx, slog.LevelInfo, "webhook received", attrs...)
+	t.logger.LogAttrs(ctx, level, "webhook received", attrs...)
 }
 
 func sanitizeLog(value string) string {
 	return nonPrintable.ReplaceAllLiteralString(value[:min(len(value), logFieldCap)], "_")
 }
 
-func rejectReason(status int) string {
+func rejectLog(status int) (slog.Level, string) {
 	switch status {
 	case http.StatusUnauthorized:
-		return "bad_signature"
+		return slog.LevelInfo, "bad_signature"
 	case http.StatusRequestEntityTooLarge:
-		return "size_cap"
+		return slog.LevelInfo, "size_cap"
 	case http.StatusConflict:
-		return "body_conflict"
+		return slog.LevelWarn, "body_conflict"
 	case http.StatusServiceUnavailable:
-		return "store_unavailable"
+		return slog.LevelError, "store_unavailable"
 	default:
-		return "bad_body"
+		return slog.LevelInfo, "bad_body"
 	}
 }

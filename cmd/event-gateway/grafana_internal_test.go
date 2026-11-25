@@ -14,7 +14,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -183,29 +182,54 @@ func TestGrafanaWebhookLogging(t *testing.T) {
 
 	var logs bytes.Buffer
 
-	hook, _ := grafanaHook(t)
+	hook, store := grafanaHook(t)
 	hook.telemetry = newTelemetry(slog.NewJSONHandler(&logs, nil), nil, nil)
 
 	ctx := t.Context()
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+
 	body := alertsBody(hostAlert)
 	delivery := grafanaDelivery([]byte(body), 0)
-	repo := "hosts/web-1"
+	clashBody := body + " "
+	clashDelivery := grafanaDelivery([]byte(clashBody), 0)
+	clash, err := normalizeGrafana([]byte(hostAlert), clashDelivery, time.Now())
+	checkError(t, err)
 
+	clash.Payload = []byte("{}")
+	checkError(t, store.publish(ctx, clash))
+
+	repo := "hosts/web-1"
 	badSig := grafanaSigned(ctx, body)
 	badSig.Header.Set(grafanaSignature, zeroDigest)
 
+	oversized := grafanaSigned(ctx, "{}")
+	oversized.ContentLength = grafanaBodyCap + 1
+
+	const (
+		alertEvent  = "alert"
+		firingEvent = "alert.firing"
+	)
+
 	for _, test := range []struct {
-		req      *http.Request
-		repo     *string
-		event    string
-		delivery string
-		outcome  string
-		reason   string
-		status   int
+		req                                     *http.Request
+		repo                                    *string
+		level, event, delivery, outcome, reason string
+		status                                  int
 	}{
-		{grafanaSigned(ctx, body), &repo, "alert.firing", delivery, outcomeAccepted, "", http.StatusAccepted},
-		{grafanaSigned(ctx, body), &repo, "alert.firing", delivery, outcomeDuplicate, "", http.StatusAccepted},
-		{badSig, nil, "alert", "", outcomeRejected, "bad_signature", http.StatusUnauthorized},
+		{grafanaSigned(ctx, body), &repo, "", firingEvent, delivery, outcomeAccepted, "", http.StatusAccepted},
+		{grafanaSigned(ctx, body), &repo, "", firingEvent, delivery, outcomeDuplicate, "", http.StatusAccepted},
+		{
+			grafanaSigned(ctx, clashBody),
+			&repo, "WARN", firingEvent, clashDelivery, outcomeRejected, "body_conflict", http.StatusConflict,
+		},
+		{badSig, nil, "", alertEvent, "", outcomeRejected, "bad_signature", http.StatusUnauthorized},
+		{grafanaSigned(ctx, "{}"), nil, "", alertEvent, "", outcomeRejected, "bad_body", http.StatusBadRequest},
+		{oversized, nil, "", alertEvent, "", outcomeRejected, "size_cap", http.StatusRequestEntityTooLarge},
+		{
+			grafanaSigned(canceled, body),
+			&repo, "ERROR", firingEvent, delivery, outcomeRejected, "store_unavailable", http.StatusServiceUnavailable,
+		},
 	} {
 		logs.Reset()
 
@@ -217,13 +241,10 @@ func TestGrafanaWebhookLogging(t *testing.T) {
 			checkEqual(t, strings.Contains(output, forbidden), false)
 		}
 
-		entry := readWebhookLog(t, output)
-		checkEqual(t, entry.Provider, grafanaProvider)
-		checkEqual(t, entry.Event, test.event)
-		checkEqual(t, entry.Delivery, test.delivery)
-		checkEqual(t, entry.Status, test.status)
-		checkEqual(t, entry.Outcome, test.outcome)
-		checkEqual(t, entry.Reason, test.reason)
-		checkEqual(t, reflect.DeepEqual(entry.Repository, test.repo), true)
+		//nolint:exhaustruct_v5 // checkWebhookLog fills Msg and defaults Level.
+		checkWebhookLog(t, output, webhookLog{
+			Repository: test.repo, Level: test.level, Provider: grafanaProvider, Event: test.event,
+			Delivery: test.delivery, Outcome: test.outcome, Reason: test.reason, Status: test.status,
+		})
 	}
 }

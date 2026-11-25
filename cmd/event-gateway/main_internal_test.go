@@ -141,15 +141,27 @@ func TestGitHubWebhookRequiresSecret(t *testing.T) {
 	}
 }
 
+var errAccept = errors.New("accept failed")
+
+type failingListener struct{}
+
+func (failingListener) Accept() (net.Conn, error) { return nil, errAccept }
+func (failingListener) Close() error              { return nil }
+func (failingListener) Addr() net.Addr            { return nil }
+
 func TestServeInvalidListenAddress(t *testing.T) {
 	t.Parallel()
 
+	var logs bytes.Buffer
+
 	args := []string{serveCommand, "-listen=127.0.0.1:-1", storeDirFlag + t.TempDir(), "-github-secret=" + fixtureKey}
 
-	err := run(t.Context(), io.Discard, slog.DiscardHandler, args)
+	err := run(t.Context(), io.Discard, slog.NewJSONHandler(&logs, nil), args)
 	if err == nil {
 		t.Fatal("serve accepted an invalid listen address")
 	}
+
+	checkEqual(t, logs.Len(), 0)
 }
 
 func TestServeValidSecretAndContextShutdown(t *testing.T) {
@@ -179,7 +191,7 @@ func TestServeValidSecretAndContextShutdown(t *testing.T) {
 		return new(fakeTemporalClient), nil
 	})
 
-	exerciseServe(t, file, http.StatusNotFound)
+	exerciseServe(t, file, http.StatusNotFound, "-session-listen=")
 	checkEqual(t, exports.Load(), 0)
 
 	exerciseServe(t, file, http.StatusUnauthorized, "-grafana-secret-file="+file,
@@ -187,6 +199,24 @@ func TestServeValidSecretAndContextShutdown(t *testing.T) {
 		"-otlp-endpoint="+collector.URL, "-otlp-header=X-Collector-Test=test=value", "-session-listen=127.0.0.1:0")
 	checkEqual(t, exports.Load() > 0, true)
 	checkEqual(t, sentHeader.Load(), true)
+
+	var bound string
+
+	original := listenTCP
+	listenTCP = func(_ context.Context, addr string) (net.Listener, error) {
+		bound = addr
+
+		return failingListener{}, nil
+	}
+
+	defer func() { listenTCP = original }()
+
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+
+	args := []string{serveCommand, "-listen=", storeDirFlag + t.TempDir(), "-github-secret-file=" + file}
+	checkEqual(t, errors.Is(run(ctx, io.Discard, slog.DiscardHandler, args), errAccept), true)
+	checkEqual(t, bound, ":http")
 }
 
 func exerciseServe(t *testing.T, file string, grafanaStatus int, flags ...string) {
@@ -195,13 +225,20 @@ func exerciseServe(t *testing.T, file string, grafanaStatus int, flags ...string
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 
-	var listenConfig net.ListenConfig
-
-	listener, err := listenConfig.Listen(ctx, "tcp", "127.0.0.1:0")
+	listener, err := listenTCP(ctx, "127.0.0.1:0")
 	checkError(t, err)
 
 	address := listener.Addr().String()
-	checkError(t, listener.Close())
+	original := listenTCP
+	listenTCP = func(ctx context.Context, addr string) (net.Listener, error) {
+		if addr == address {
+			return listener, nil
+		}
+
+		return original(ctx, addr)
+	}
+
+	defer func() { listenTCP = original }()
 
 	dir := t.TempDir()
 	tokens := filepath.Join(dir, "tokens-file-fixture")
@@ -269,20 +306,17 @@ func exerciseServe(t *testing.T, file string, grafanaStatus int, flags ...string
 		t.Fatal("gateway did not shut down after context cancellation")
 	}
 
-	output := logs.String()
-	for _, forbidden := range []string{
-		fixtureKey, readFixture, file, tokens, "secret-file-fixture", "tokens-file-fixture", "private test payload",
-	} {
-		checkEqual(t, strings.Contains(output, forbidden), false)
-	}
-
-	checkStartupLog(t, output, address, dir, len(flags) > 0)
+	checkStartupLog(t, logs.String(), address, dir, len(flags) > 1)
 }
 
 func checkStartupLog(t *testing.T, output, listen, storeDir string, withExtras bool) {
 	t.Helper()
 
-	line, _, _ := strings.Cut(output, "\n")
+	for _, forbidden := range []string{
+		fixtureKey, readFixture, "secret-file-fixture", "tokens-file-fixture", "private test payload",
+	} {
+		checkEqual(t, strings.Contains(output, forbidden), false)
+	}
 
 	//nolint:tagliatelle // Matches the slog JSON record keys.
 	var started struct {
@@ -297,23 +331,31 @@ func checkStartupLog(t *testing.T, output, listen, storeDir string, withExtras b
 		Rules         int    `json:"rules"`
 	}
 
-	checkError(t, json.Unmarshal([]byte(line), &started))
+	var count int
+
+	for line := range strings.SplitSeq(strings.TrimSpace(output), "\n") {
+		if strings.Contains(line, `"event gateway started"`) {
+			count++
+
+			checkError(t, json.Unmarshal([]byte(line), &started))
+		}
+	}
+
+	wantSession, wantRules := "", 0
+	if withExtras {
+		wantSession, wantRules = "127.0.0.1:0", 1
+	}
+
+	checkEqual(t, count, 1)
 	checkEqual(t, started.Level, "INFO")
 	checkEqual(t, started.Msg, "event gateway started")
 	checkEqual(t, started.Version, version)
 	checkEqual(t, started.Listen, listen)
 	checkEqual(t, started.ReadListen, "127.0.0.1:0")
 	checkEqual(t, started.StoreDir, storeDir)
-
-	if withExtras {
-		checkEqual(t, started.SessionListen, "127.0.0.1:0")
-		checkEqual(t, started.Targets, 1)
-		checkEqual(t, started.Rules, 1)
-	} else {
-		checkEqual(t, started.SessionListen, "")
-		checkEqual(t, started.Targets, 0)
-		checkEqual(t, started.Rules, 0)
-	}
+	checkEqual(t, started.SessionListen, wantSession)
+	checkEqual(t, started.Targets, wantRules)
+	checkEqual(t, started.Rules, wantRules)
 }
 
 func expectHTTPStatus(t *testing.T, client *http.Client, req *http.Request, status int) {
@@ -336,19 +378,31 @@ func TestExitCode(t *testing.T) {
 func TestRoutes(t *testing.T) {
 	t.Parallel()
 
-	var hook githubWebhook
+	var logs bytes.Buffer
+
+	signals := newTelemetry(slog.NewJSONHandler(&logs, nil), nil, nil)
+	//nolint:exhaustruct_v5 // Route dispatch only uses telemetry.
+	hook := &githubWebhook{telemetry: signals}
+	//nolint:exhaustruct_v5 // Route dispatch does not use the store or secret.
+	enabled := withGrafana(&grafanaWebhook{}, hook, eventStore{}, signals)
 
 	for _, test := range []struct {
-		method string
-		path   string
-		status int
+		handler http.Handler
+		method  string
+		path    string
+		status  int
 	}{
-		{http.MethodGet, healthPath, http.StatusOK},
-		{http.MethodGet, webhookPath, http.StatusNotFound},
-		{http.MethodPost, healthPath, http.StatusNotFound},
-		{http.MethodPost, "/" + webhookPath, http.StatusNotFound},
+		{hook, http.MethodGet, healthPath, http.StatusOK},
+		{hook, http.MethodGet, webhookPath, http.StatusNotFound},
+		{hook, http.MethodPost, grafanaPath, http.StatusNotFound},
+		{enabled, http.MethodGet, grafanaPath, http.StatusMethodNotAllowed},
+		{enabled, http.MethodGet, webhookPath, http.StatusNotFound},
+		{hook, http.MethodPost, healthPath, http.StatusNotFound},
+		{hook, http.MethodPost, "/" + webhookPath, http.StatusNotFound},
 	} {
 		req := httptest.NewRequestWithContext(t.Context(), test.method, test.path, nil)
-		expectStatus(t, hook.ServeHTTP, req, test.status)
+		expectStatus(t, test.handler.ServeHTTP, req, test.status)
 	}
+
+	checkEqual(t, logs.Len(), 0)
 }

@@ -384,30 +384,30 @@ type webhookLog struct {
 	Status     int     `json:"status"`
 }
 
-func readWebhookLog(t *testing.T, output string) webhookLog {
+func checkWebhookLog(t *testing.T, output string, want webhookLog) {
 	t.Helper()
 
-	var matches []webhookLog
-
-	for line := range strings.SplitSeq(strings.TrimSpace(output), "\n") {
-		var entry webhookLog
-		checkError(t, json.Unmarshal([]byte(line), &entry))
-
-		if entry.Msg == "webhook received" {
-			matches = append(matches, entry)
-		}
+	if want.Level == "" {
+		want.Level = "INFO"
 	}
 
-	checkEqual(t, len(matches), 1)
-	checkEqual(t, matches[0].Level, "INFO")
+	want.Msg = "webhook received"
 
-	return matches[0]
+	checkEqual(t, strings.Count(output, "\n"), 1)
+
+	var got webhookLog
+	checkError(t, json.Unmarshal([]byte(output), &got))
+	checkEqual(t, len(got.Delivery) <= logFieldCap, true)
+	checkEqual(t, reflect.DeepEqual(got, want), true)
 }
 
 func TestGitHubWebhookLogging(t *testing.T) {
 	t.Parallel()
 
-	const body = `{"repository":{"full_name":"example/repository"},"secret":"github-body-secret-fixture"}`
+	const (
+		delivery = "delivery-1"
+		body     = `{"repository":{"full_name":"example/repository"},"secret":"github-body-secret-fixture"}`
+	)
 
 	var logs bytes.Buffer
 
@@ -431,28 +431,25 @@ func TestGitHubWebhookLogging(t *testing.T) {
 	oversizeBody(oversized)
 
 	repo := "example/repository"
+	post := func(reqCtx context.Context, id, payload string) *http.Request {
+		return signedRequest(reqCtx, issuesEvent, id, payload)
+	}
 
 	for _, test := range []struct {
-		req      *http.Request
-		repo     *string
-		delivery string
-		outcome  string
-		reason   string
-		status   int
+		req                              *http.Request
+		repo                             *string
+		level, delivery, outcome, reason string
+		status                           int
 	}{
+		{post(ctx, delivery, body), &repo, "", delivery, outcomeAccepted, "", http.StatusAccepted},
+		{post(ctx, delivery, body), &repo, "", delivery, outcomeDuplicate, "", http.StatusAccepted},
+		{post(ctx, delivery, body+" "), &repo, "WARN", delivery, outcomeRejected, "body_conflict", http.StatusConflict},
+		{badSig, nil, "", sanitizedDelivery, outcomeRejected, "bad_signature", http.StatusUnauthorized},
+		{post(ctx, "delivery-2", "{"), nil, "", "delivery-2", outcomeRejected, "bad_body", http.StatusBadRequest},
+		{oversized, nil, "", "delivery-3", outcomeRejected, "size_cap", http.StatusRequestEntityTooLarge},
 		{
-			signedRequest(ctx, issuesEvent, "delivery-1", body),
-			&repo, "delivery-1", outcomeAccepted, "", http.StatusAccepted,
-		},
-		{
-			signedRequest(ctx, issuesEvent, "delivery-1", body),
-			&repo, "delivery-1", outcomeDuplicate, "", http.StatusAccepted,
-		},
-		{badSig, nil, sanitizedDelivery, outcomeRejected, "bad_signature", http.StatusUnauthorized},
-		{oversized, nil, "delivery-3", outcomeRejected, "size_cap", http.StatusRequestEntityTooLarge},
-		{
-			signedRequest(canceled, issuesEvent, "delivery-4", body),
-			&repo, "delivery-4", outcomeRejected, "store_unavailable", http.StatusServiceUnavailable,
+			post(canceled, "d-4", body),
+			&repo, "ERROR", "d-4", outcomeRejected, "store_unavailable", http.StatusServiceUnavailable,
 		},
 	} {
 		logs.Reset()
@@ -465,14 +462,10 @@ func TestGitHubWebhookLogging(t *testing.T) {
 			checkEqual(t, strings.Contains(output, forbidden), false)
 		}
 
-		entry := readWebhookLog(t, output)
-		checkEqual(t, entry.Provider, "github")
-		checkEqual(t, entry.Event, issuesEvent)
-		checkEqual(t, entry.Delivery, test.delivery)
-		checkEqual(t, len(entry.Delivery) <= logFieldCap, true)
-		checkEqual(t, entry.Status, test.status)
-		checkEqual(t, entry.Outcome, test.outcome)
-		checkEqual(t, entry.Reason, test.reason)
-		checkEqual(t, reflect.DeepEqual(entry.Repository, test.repo), true)
+		//nolint:exhaustruct_v5 // checkWebhookLog fills Msg and defaults Level.
+		checkWebhookLog(t, output, webhookLog{
+			Repository: test.repo, Level: test.level, Provider: parkedFixtureProvider, Event: issuesEvent,
+			Delivery: test.delivery, Outcome: test.outcome, Reason: test.reason, Status: test.status,
+		})
 	}
 }

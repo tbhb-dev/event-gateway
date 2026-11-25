@@ -5,7 +5,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -160,9 +159,7 @@ func (h *githubWebhook) receive(response http.ResponseWriter, request *http.Requ
 	response.WriteHeader(status)
 }
 
-func (h *githubWebhook) ingest(
-	response http.ResponseWriter, request *http.Request,
-) (string, envelope, int, bool) {
+func (h *githubWebhook) ingest(response http.ResponseWriter, request *http.Request) (string, envelope, int, bool) {
 	receivedAt := time.Now().UTC()
 	signature := request.Header.Get("X-Hub-Signature-256")
 	rawEvent := request.Header.Get(eventHeader)
@@ -199,7 +196,7 @@ func (h *githubWebhook) ingest(
 
 	err = validateEvent(event, body)
 	if err != nil {
-		return event, meta, h.publishStatus(request.Context(), err), false
+		return event, meta, publishStatus(err), false
 	}
 
 	if !githubDelivery.MatchString(delivery) {
@@ -217,10 +214,10 @@ func (h *githubWebhook) ingest(
 
 	err = h.store.publish(request.Context(), normalized)
 
-	return event, normalized, h.publishStatus(request.Context(), err), errors.Is(err, errDuplicate)
+	return event, normalized, publishStatus(err), errors.Is(err, errDuplicate)
 }
 
-func (h *githubWebhook) publishStatus(ctx context.Context, err error) int {
+func publishStatus(err error) int {
 	switch {
 	case err == nil, errors.Is(err, errDuplicate):
 		return http.StatusAccepted
@@ -229,12 +226,8 @@ func (h *githubWebhook) publishStatus(ctx context.Context, err error) int {
 	case errors.Is(err, nats.ErrMaxPayload):
 		return http.StatusRequestEntityTooLarge
 	case errors.Is(err, errBodyConflict):
-		h.telemetry.logger.WarnContext(ctx, "GitHub delivery already has a different body")
-
 		return http.StatusConflict
 	default:
-		h.telemetry.logger.ErrorContext(ctx, "GitHub event storage unavailable")
-
 		return http.StatusServiceUnavailable
 	}
 }
