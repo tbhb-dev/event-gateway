@@ -58,7 +58,7 @@ func runMCP(ctx context.Context, logHandler slog.Handler, args []string) error {
 	logger := slog.New(logHandler)
 	subs := loadMCPSubscriptions(ctx, logger)
 
-	initialized, stopGateway := startMCPGateway(ctx, subs.list, notifier, logger)
+	initialized, stopGateway := startMCPGateway(ctx, subs, notifier, logger)
 	defer stopGateway()
 
 	server := newMCPServer(logger, subs, notifier, initialized)
@@ -279,17 +279,24 @@ func subscriptionSchema(required string) json.RawMessage {
 }
 
 type mcpSubscriptions struct {
-	state mcpState
-	subs  []filter.Subscription
-	mu    sync.Mutex
+	cursor *uint64
+	state  mcpState
+	subs   []filter.Subscription
+	mu     sync.Mutex
 }
 
-// list snapshots the set. The parsed subscriptions and their fields are immutable.
 func (s *mcpSubscriptions) list() []filter.Subscription {
+	subs, _ := s.snapshot()
+
+	return subs
+}
+
+// snapshot returns the subscriptions and cursor together. Their values are immutable.
+func (s *mcpSubscriptions) snapshot() ([]filter.Subscription, *uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	return append([]filter.Subscription{}, s.subs...)
+	return append([]filter.Subscription{}, s.subs...), s.cursor
 }
 
 func (s *mcpSubscriptions) change(
@@ -322,11 +329,7 @@ func (s *mcpSubscriptions) set(sub filter.Subscription, add bool) bool {
 		return false
 	}
 
-	// Keep the write under the same lock as the change so concurrent tools
-	// cannot persist an older snapshot over a newer one.
-	if s.state.file != "" && !s.state.write(s.subs) {
-		s.state.logger.Warn(mcpStateWriteWarning)
-	}
+	s.saveLocked()
 
 	return true
 }
