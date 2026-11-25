@@ -44,10 +44,9 @@ const (
 )
 
 var (
-	errMCPUsage       = errors.New("usage: event-gateway mcp")
-	errMCPStdinClosed = errors.New("MCP stdin closed")
-	errNoConnection   = errors.New("no MCP connection")
-	errChannelClient  = errors.New("channel delivery requires a claude-code client")
+	errMCPUsage      = errors.New("usage: event-gateway mcp")
+	errNoConnection  = errors.New("no MCP connection")
+	errChannelClient = errors.New("channel delivery requires a claude-code client")
 )
 
 //nolint:gochecknoglobals // Reuse the same immutable framing escapes for every notification.
@@ -58,8 +57,7 @@ func runMCP(ctx context.Context, logHandler slog.Handler, args []string) error {
 		return errMCPUsage
 	}
 
-	runCtx, cancel := context.WithCancelCause(ctx)
-	defer cancel(nil)
+	runCtx, cancel := context.WithCancel(ctx)
 
 	transport := &mcp.IOTransport{
 		Reader:        mcpStdin{File: os.Stdin, cancel: cancel},
@@ -72,12 +70,13 @@ func runMCP(ctx context.Context, logHandler slog.Handler, args []string) error {
 
 	initialized, stopGateway := startMCPGateway(runCtx, subs.list, notifier, logger)
 	defer stopGateway()
+	defer cancel() // Release blocked stdout writes before waiting for the gateway.
 
 	server := newMCPServer(logger, subs, notifier, initialized)
 
 	// Let the SDK handle stdin EOF as a normal transport shutdown.
 	err := server.Run(ctx, notifier)
-	if err != nil && !errors.Is(context.Cause(runCtx), errMCPStdinClosed) {
+	if err != nil {
 		return fmt.Errorf("serve MCP: %w", err)
 	}
 
@@ -87,13 +86,13 @@ func runMCP(ctx context.Context, logHandler slog.Handler, args []string) error {
 type mcpStdin struct {
 	*os.File
 
-	cancel context.CancelCauseFunc
+	cancel context.CancelFunc
 }
 
 func (in mcpStdin) Read(p []byte) (int, error) {
 	n, err := in.File.Read(p)
 	if errors.Is(err, io.EOF) || errors.Is(err, os.ErrClosed) {
-		in.cancel(errMCPStdinClosed)
+		in.cancel()
 	}
 
 	return n, err //nolint:wrapcheck // Pass through the stdin read result to the transport.

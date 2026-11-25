@@ -24,6 +24,9 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
+const mcpInitializeFrame = `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{` +
+	`"clientInfo":{"name":"claude-code","version":"test"},"protocolVersion":"2025-11-25","capabilities":{}}}` + "\n"
+
 func TestMCPCommand(t *testing.T) {
 	checkMCPGatewayLifetime(t, claudeCodeClient)
 	checkMCPGatewayLifetime(t, mcpServerName)
@@ -33,12 +36,14 @@ func TestMCPCommand(t *testing.T) {
 
 	for _, test := range []struct {
 		want        error
+		frame       string
 		cancelEarly bool
 		closeReader bool
 	}{
-		{want: nil, cancelEarly: false, closeReader: false},
-		{want: context.Canceled, cancelEarly: true, closeReader: false},
-		{want: nil, cancelEarly: false, closeReader: true},
+		{want: nil, frame: "", cancelEarly: false, closeReader: false},
+		{want: context.Canceled, frame: "", cancelEarly: true, closeReader: false},
+		{want: os.ErrClosed, frame: "", cancelEarly: false, closeReader: true},
+		{want: io.ErrUnexpectedEOF, frame: `{"jsonrpc":`, cancelEarly: false, closeReader: false},
 	} {
 		reader, writer := mcpTestPipe(t)
 		stdin := os.Stdin
@@ -55,6 +60,8 @@ func TestMCPCommand(t *testing.T) {
 		case test.closeReader:
 			checkError(t, reader.Close())
 		default:
+			_, err := io.WriteString(writer, test.frame)
+			checkError(t, err)
 			checkError(t, writer.Close())
 		}
 
@@ -66,7 +73,42 @@ func TestMCPCommand(t *testing.T) {
 	checkEqual(t, errors.Is(err, errMCPUsage), true)
 }
 
+func TestMCPStdoutWriteError(t *testing.T) {
+	t.Setenv(gatewayURLEnv, "")
+	t.Setenv(gatewayTokenEnv, "")
+
+	input, clientInput := mcpTestPipe(t)
+	_, output := mcpTestPipe(t)
+	checkError(t, output.Close())
+
+	stdin, stdout := os.Stdin, os.Stdout
+	os.Stdin, os.Stdout = input, output //nolint:reassign // Exercise the command's actual stdio transport.
+
+	t.Cleanup(func() { os.Stdin, os.Stdout = stdin, stdout }) //nolint:reassign // Restore the test process's stdio.
+
+	_, err := io.WriteString(clientInput, mcpInitializeFrame)
+	checkError(t, err)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+
+	err = runMCP(ctx, slog.DiscardHandler, nil)
+	checkEqual(t, errors.Is(err, os.ErrClosed), true)
+}
+
+//nolint:paralleltest // This test redirects process-wide stdin and stdout.
 func TestMCPStdinCloseStopsGateway(t *testing.T) {
+	checkMCPStopsGatewayWithBlockedStdout(t, "")
+}
+
+//nolint:paralleltest // This test redirects process-wide stdin and stdout.
+func TestMCPDecodeErrorStopsGateway(t *testing.T) {
+	checkMCPStopsGatewayWithBlockedStdout(t, "}\n")
+}
+
+func checkMCPStopsGatewayWithBlockedStdout(t *testing.T, malformedFrame string) {
+	t.Helper()
+
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
@@ -101,7 +143,7 @@ func TestMCPStdinCloseStopsGateway(t *testing.T) {
 		runErr = runMCP(ctx, slog.DiscardHandler, nil)
 	}()
 
-	const timeout = 10 * time.Second
+	const timeout = 15 * time.Second
 
 	t.Cleanup(func() {
 		// Release a blocked writer even when the regression is present.
@@ -126,27 +168,37 @@ func TestMCPStdinCloseStopsGateway(t *testing.T) {
 		t.Fatal("MCP server did not start writing the gateway notification")
 	}
 
-	checkError(t, clientInput.Close())
+	if malformedFrame == "" {
+		checkError(t, clientInput.Close())
+	} else {
+		// Keep stdin open so shutdown depends on the decoder reporting the error.
+		_, err := io.WriteString(clientInput, malformedFrame)
+		checkError(t, err)
+	}
 
 	select {
 	case <-done:
-		checkError(t, runErr)
+		if malformedFrame == "" {
+			checkError(t, runErr)
+		} else {
+			_, ok := errors.AsType[*json.SyntaxError](runErr)
+			checkEqual(t, ok, true)
+		}
 	case <-time.After(timeout):
-		t.Fatal("MCP server did not return after stdin closed with stdout blocked")
+		t.Fatal("MCP server did not return with stdout blocked")
 	}
 
 	select {
 	case <-disconnected:
 	case <-time.After(timeout):
-		t.Fatal("MCP gateway stayed connected after stdin closed")
+		t.Fatal("MCP gateway stayed connected after the server returned")
 	}
 }
 
 func startMCPPipeClient(input io.Writer, output io.Reader) error {
 	reader := bufio.NewReader(output)
 
-	_, err := io.WriteString(input, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{`+
-		`"clientInfo":{"name":"claude-code","version":"test"},"protocolVersion":"2025-11-25","capabilities":{}}}`+"\n")
+	_, err := io.WriteString(input, mcpInitializeFrame)
 	if err != nil {
 		return err //nolint:wrapcheck // Report the pipe failure to the test.
 	}
