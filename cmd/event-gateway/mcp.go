@@ -33,6 +33,7 @@ const (
 	channelProviderKey    = "provider"
 	channelRepositoryKey  = "repository"
 	channelTruncated      = "true"
+	channelWarning        = "warning"
 	claudeCodeClient      = "claude-code"
 	mcpServerName         = "event-gateway"
 	maxChannelContent     = 64 * 1024
@@ -54,7 +55,13 @@ func runMCP(ctx context.Context, logHandler slog.Handler, args []string) error {
 	}
 
 	notifier := &notifyingTransport{inner: &mcp.StdioTransport{MaxLineLength: 0}, conn: nil, mu: sync.Mutex{}}
-	server := newMCPServer(slog.New(logHandler), new(mcpSubscriptions), notifier)
+	subs := new(mcpSubscriptions)
+	logger := slog.New(logHandler)
+
+	initialized, stopGateway := startMCPGateway(ctx, subs.list, notifier, logger)
+	defer stopGateway()
+
+	server := newMCPServer(logger, subs, notifier, initialized)
 
 	err := server.Run(ctx, notifier)
 	if err != nil {
@@ -64,11 +71,18 @@ func runMCP(ctx context.Context, logHandler slog.Handler, args []string) error {
 	return nil
 }
 
-func newMCPServer(logger *slog.Logger, subs *mcpSubscriptions, notifier *notifyingTransport) *mcp.Server {
+func newMCPServer(
+	logger *slog.Logger,
+	subs *mcpSubscriptions,
+	notifier *notifyingTransport,
+	initialized func(context.Context, *mcp.InitializedRequest),
+) *mcp.Server {
 	//nolint:exhaustruct_v5 // Keep SDK defaults for unused protocol features.
 	server := mcp.NewServer(&mcp.Implementation{Name: mcpServerName, Version: version}, &mcp.ServerOptions{
-		Logger:       logger,
-		Instructions: "After a restart or reconnect, call check_delivery and confirm both events arrive: self_test and echo.",
+		Logger:             logger,
+		InitializedHandler: initialized,
+		Instructions: "After a restart or reconnect, call check_delivery and confirm both events arrive: " +
+			"self_test and echo.",
 		Capabilities: &mcp.ServerCapabilities{
 			Experimental: map[string]any{channelCapability: map[string]any{}},
 			Logging:      &mcp.LoggingCapabilities{}, //nolint:staticcheck // Advertise logging for the negotiated protocols.
@@ -222,7 +236,7 @@ type channelNotice struct {
 }
 
 func gatewayConnectionLost() channelNotice {
-	return channelNotice{Level: "warning", Text: "Gateway connection lost."}
+	return channelNotice{Level: channelWarning, Text: "Gateway connection lost."}
 }
 
 func gatewayReconnected() channelNotice {
@@ -231,22 +245,18 @@ func gatewayReconnected() channelNotice {
 
 func gatewayGap(from, to uint64) channelNotice {
 	return channelNotice{
-		Level: "warning",
+		Level: channelWarning,
 		Text:  fmt.Sprintf("Gateway events %d through %d are no longer available.", from, to),
 	}
 }
 
-func (t *notifyingTransport) deliverNotice(
-	ctx context.Context,
-	session *mcp.ServerSession,
-	notice channelNotice,
-) error {
+func (notice channelNotice) channelEvent() channelEvent {
 	//nolint:errcheck,errchkjson // The notice contains only strings.
 	payload, _ := json.Marshal(notice)
 
-	return t.deliverChannel(ctx, session, channelEvent{
+	return channelEvent{
 		provider: mcpServerName, event: "notice", delivery: "", repository: nil, payload: payload,
-	})
+	}
 }
 
 func subscriptionSchema(required string) json.RawMessage {

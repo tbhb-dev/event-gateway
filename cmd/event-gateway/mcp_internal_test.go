@@ -21,8 +21,13 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-//nolint:paralleltest // The SDK stdio transport reads the process's stdin.
 func TestMCPCommand(t *testing.T) {
+	checkMCPGatewayLifetime(t, claudeCodeClient)
+	checkMCPGatewayLifetime(t, mcpServerName)
+
+	t.Setenv(gatewayURLEnv, "")
+	t.Setenv(gatewayTokenEnv, "")
+
 	for _, cancelEarly := range []bool{false, true} {
 		reader, writer, err := os.Pipe()
 		checkError(t, err)
@@ -73,7 +78,7 @@ func connectMCPClient(
 	logger := slog.New(slog.DiscardHandler)
 	in, out := mcp.NewInMemoryTransports()
 	notifier := &notifyingTransport{inner: in, conn: nil, mu: sync.Mutex{}}
-	server := newMCPServer(logger, new(mcpSubscriptions), notifier)
+	server := newMCPServer(logger, new(mcpSubscriptions), notifier, nil)
 	peer, err := server.Connect(ctx, notifier, nil)
 	checkError(t, err)
 	t.Cleanup(func() { checkError(t, peer.Close()) })
@@ -253,7 +258,7 @@ func TestMCPChannelBeforeClientName(t *testing.T) {
 	for _, init := range []*mcp.InitializeParams{nil, new(mcp.InitializeParams)} {
 		in, _ := mcp.NewInMemoryTransports()
 		notifier := &notifyingTransport{inner: in, conn: nil, mu: sync.Mutex{}}
-		server := newMCPServer(slog.New(slog.DiscardHandler), new(mcpSubscriptions), notifier)
+		server := newMCPServer(slog.New(slog.DiscardHandler), new(mcpSubscriptions), notifier, nil)
 		//nolint:exhaustruct_v5 // Only the client's initialization state matters here.
 		opts := &mcp.ServerSessionOptions{State: &mcp.ServerSessionState{InitializeParams: init}}
 		peer, err := server.Connect(t.Context(), notifier, opts)
@@ -335,7 +340,7 @@ func TestMCPChannelNotice(t *testing.T) {
 		{gatewayReconnected(), `{"level":"info","text":"Gateway reconnected."}`},
 		{gatewayGap(3, 5), `{"level":"warning","text":"Gateway events 3 through 5 are no longer available."}`},
 	} {
-		checkError(t, notifier.deliverNotice(ctx, peer, test.notice))
+		checkError(t, notifier.deliverChannel(ctx, peer, test.notice.channelEvent()))
 
 		select {
 		case req := <-notifications:
