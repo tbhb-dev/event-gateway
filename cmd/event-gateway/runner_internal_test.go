@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"sync"
 	"testing"
@@ -95,28 +96,31 @@ func TestRunnerDelivery(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
-		name string
 		fail func() error
+		name string
+		park string
 		want []uint64
-		hook bool
 	}{
-		{name: "transient", fail: func() error { return errRetryDelivery }, want: []uint64{1, 1, 2}, hook: false},
+		{name: "transient", fail: func() error { return errRetryDelivery }, want: []uint64{1, 1, 2}},
 		{
 			name: "permanent", fail: func() error { return fmt.Errorf("delivery: %w", ErrPermanent) },
-			want: []uint64{1, 2}, hook: true,
+			want: []uint64{1, 2}, park: "delivery: permanent",
 		},
-		{name: "panic", fail: func() error { panic(testEnvelope) }, want: []uint64{1, 2}, hook: true},
+		{
+			name: "panic", fail: func() error { panic(testEnvelope) },
+			want: []uint64{1, 2}, park: errTargetPanic.Error(),
+		},
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
 			store := testStore(t, retention)
+			parked := testParkedStream(t, store)
 			publishRunner(t, store, pullSubject)
 			publishRunner(t, store, pullSubject)
 
 			events := make(chan Event, 8)
-			permanent := make(chan Event, 2)
 			first := true
 
 			target := fakeTarget{name: test.name, deliver: func(_ context.Context, event Event) error {
@@ -133,23 +137,27 @@ func TestRunnerDelivery(t *testing.T) {
 			run := &runner{stream: store.stream, retryBase: time.Millisecond, targets: []runnerTarget{{
 				Target: target, Subjects: nil, Start: startPosition{all: true},
 			}}}
+			park := parkHook(store.jet, newTelemetry(slog.DiscardHandler, nil, nil), 0)
 			run.onPermanent = func(ctx context.Context, name string, event Event, err error) {
-				if name == test.name && errors.Is(err, ErrPermanent) {
-					permanent <- event
-				}
-
 				logPermanent(ctx, name, event, err)
+				park(ctx, name, event, err)
 			}
 
 			stop := startRunner(t, run)
 			expectRunner(t, events, test.want...)
 			stop()
 
-			if test.hook {
-				expectRunner(t, permanent, 1)
-			}
+			records, err := listParked(t.Context(), parked, "", 0)
+			checkError(t, err)
 
-			checkEqual(t, len(permanent), 0)
+			if test.park == "" {
+				checkEqual(t, len(records), 0)
+			} else {
+				checkEqual(t, len(records), 1)
+				checkEqual(t, records[0].Seq, uint64(1))
+				checkEqual(t, records[0].Target, test.name)
+				checkEqual(t, records[0].Error, test.park)
+			}
 
 			info, err := store.stream.Consumer(t.Context(), test.name)
 			checkError(t, err)

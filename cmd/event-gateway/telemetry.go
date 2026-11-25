@@ -17,13 +17,15 @@ import (
 
 const serviceName = "event-gateway"
 
-// telemetry carries the logger, tracer and counter the handlers record to.
+// telemetry carries the logger, tracer and counters the gateway records to.
 // The caller supplies the providers, so nothing here reads the environment.
 // A nil provider falls back to a no-op one.
 type telemetry struct {
-	logger *slog.Logger
-	tracer trace.Tracer
-	ingest metric.Int64Counter
+	logger     *slog.Logger
+	tracer     trace.Tracer
+	ingest     metric.Int64Counter
+	parked     metric.Int64Counter
+	parkFailed metric.Int64Counter
 }
 
 func newTelemetry(handler slog.Handler, tracer trace.TracerProvider, meter metric.MeterProvider) telemetry {
@@ -35,13 +37,20 @@ func newTelemetry(handler slog.Handler, tracer trace.TracerProvider, meter metri
 		meter = metricnoop.NewMeterProvider()
 	}
 
+	signals := meter.Meter(serviceName)
+	//nolint:errcheck // The counter names are valid, fixed instrument names.
+	ingest, _ := signals.Int64Counter("event_gateway_ingest_total")
 	//nolint:errcheck // The counter name is a valid, fixed instrument name.
-	ingest, _ := meter.Meter(serviceName).Int64Counter("event_gateway_ingest_total")
+	parked, _ := signals.Int64Counter("event_gateway_parked_total")
+	//nolint:errcheck // The counter name is a valid, fixed instrument name.
+	parkFailed, _ := signals.Int64Counter("event_gateway_park_publish_failed_total")
 
 	return telemetry{
-		logger: slog.New(handler),
-		tracer: tracer.Tracer(serviceName),
-		ingest: ingest,
+		logger:     slog.New(handler),
+		tracer:     tracer.Tracer(serviceName),
+		ingest:     ingest,
+		parked:     parked,
+		parkFailed: parkFailed,
 	}
 }
 
