@@ -49,9 +49,12 @@ func run(ctx context.Context, out io.Writer, logHandler slog.Handler, args []str
 		return nil
 	}
 
-	if args[0] != serveCommand {
+	switch args[0] {
+	case serveCommand:
+		return serve(ctx, out, logHandler, args[1:])
+	case healthcheckCommand:
+		return healthcheck(ctx, args[1:])
+	default:
 		return errUsage
 	}
-
-	return serve(ctx, out, logHandler, args[1:])
 }
