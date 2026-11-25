@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright Tony Burns
-# cspell:words eventfields
+# cspell:words eventfields temporaltarget
 
 load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
 load("@tbhb_rules//repo:defs.bzl", "repo_files")
@@ -33,6 +33,7 @@ go_library(
         "//internal/eventfields",
         "//internal/filter",
         "//internal/routing",
+        "//internal/temporaltarget",
         "@com_github_coder_websocket//:websocket",
         "@com_github_go_logr_logr//:logr",
         "@com_github_nats_io_nats_go//:nats_go",
@@ -92,6 +93,7 @@ go_test(
     deps = [
         "//internal/eventfields",
         "//internal/routing",
+        "//internal/temporaltarget",
         "@com_github_coder_websocket//:websocket",
         "@com_github_go_logr_logr//funcr",
         "@com_github_nats_io_nats_go//:nats_go",
