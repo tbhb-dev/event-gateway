@@ -16,6 +16,9 @@ import (
 )
 
 const (
+	// OutputLimit is the most output, in bytes, a Runner captures from one command.
+	OutputLimit = 1 << 20
+
 	defaultTimeout = 10 * time.Minute
 	waitDelay      = 5 * time.Second
 )
@@ -32,11 +35,12 @@ type Command struct {
 }
 
 // Result is the outcome of a command that ran to completion. Output holds the
-// standard output and standard error, interleaved.
+// standard output and standard error, interleaved and capped at OutputLimit.
 type Result struct {
-	Output   string
-	Duration time.Duration
-	ExitCode int
+	Output    string
+	Duration  time.Duration
+	ExitCode  int
+	Truncated bool
 }
 
 // TimeoutError reports a command that did not finish within its timeout.
@@ -47,6 +51,17 @@ type TimeoutError struct {
 // Error implements error.
 func (e *TimeoutError) Error() string {
 	return fmt.Sprintf("command exceeded its timeout of %s", e.Timeout)
+}
+
+// OutputCapError reports a command whose output went past OutputLimit. The
+// Result returned with it holds the first OutputLimit bytes.
+type OutputCapError struct {
+	Limit int
+}
+
+// Error implements error.
+func (e *OutputCapError) Error() string {
+	return fmt.Sprintf("command output exceeded %d bytes", e.Limit)
 }
 
 // NotAllowedError reports an executable that is not on the allow-list or is not
@@ -92,8 +107,9 @@ func fixedPath(name string) bool {
 
 // Run runs one command and waits for it. A command that exits with a nonzero
 // status is not an error: the status is in Result.ExitCode. Run returns a
-// *NotAllowedError or *TimeoutError for those failures, and the Result of a
-// timeout holds the output captured so far.
+// *NotAllowedError, *TimeoutError, or *OutputCapError for those failures, and
+// the Result of the last two holds the output captured so far. A command that
+// fails and also goes past the cap returns both errors joined.
 func (r *Runner) Run(ctx context.Context, command Command) (Result, error) {
 	if _, ok := r.allowed[command.Executable]; !ok {
 		return Result{}, &NotAllowedError{Executable: command.Executable}
@@ -104,7 +120,7 @@ func (r *Runner) Run(ctx context.Context, command Command) (Result, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	var out bytes.Buffer
+	var out capture
 
 	//nolint:gosec // The executable is matched against the allow-list above.
 	cmd := exec.CommandContext(ctx, command.Executable, command.Args...)
@@ -116,21 +132,52 @@ func (r *Runner) Run(ctx context.Context, command Command) (Result, error) {
 	start := time.Now()
 	err := cmd.Run()
 	result := Result{
-		Output:   out.String(),
-		Duration: time.Since(start),
-		ExitCode: cmd.ProcessState.ExitCode(),
+		Output:    out.buf.String(),
+		Duration:  time.Since(start),
+		ExitCode:  cmd.ProcessState.ExitCode(),
+		Truncated: out.truncated,
 	}
 
-	var exitErr *exec.ExitError
+	var (
+		exitErr *exec.ExitError
+		runErr  error
+	)
 
 	switch {
 	case err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded):
-		return result, &TimeoutError{Timeout: timeout}
+		runErr = &TimeoutError{Timeout: timeout}
 	case err != nil && ctx.Err() != nil:
-		return result, fmt.Errorf("run %q: %w", command.Executable, ctx.Err())
+		runErr = fmt.Errorf("run %q: %w", command.Executable, ctx.Err())
 	case err != nil && !errors.As(err, &exitErr):
-		return result, fmt.Errorf("run %q: %w", command.Executable, err)
-	default:
-		return result, nil
+		runErr = fmt.Errorf("run %q: %w", command.Executable, err)
 	}
+
+	// The cap error joins any other failure, so a command that floods and then
+	// times out reports both.
+	if out.truncated {
+		runErr = errors.Join(runErr, &OutputCapError{Limit: OutputLimit})
+	}
+
+	return result, runErr
+}
+
+// capture keeps the first OutputLimit bytes written to it and discards the
+// rest, so the command never blocks on a full pipe.
+type capture struct {
+	buf       bytes.Buffer
+	truncated bool
+}
+
+// Write implements io.Writer.
+func (c *capture) Write(data []byte) (int, error) {
+	size := len(data)
+
+	if room := OutputLimit - c.buf.Len(); size > room {
+		c.truncated = true
+		data = data[:room]
+	}
+
+	c.buf.Write(data)
+
+	return size, nil
 }
