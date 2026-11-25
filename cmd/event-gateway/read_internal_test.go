@@ -57,6 +57,12 @@ func TestReadTokenReload(t *testing.T) {
 	writeReadTokens(t, tokens.path, "first", readFixture)
 	checkError(t, tokens.load())
 
+	for _, contents := range []string{"", "# comment\n"} {
+		checkError(t, os.WriteFile(tokens.path, []byte(contents), 0o600))
+		checkEqual(t, tokens.load(), errTokenFormat)
+		checkEqual(t, tokens.authenticate("Bearer "+readFixture), "first")
+	}
+
 	api := readAPI{tokens: &tokens, store: eventStore{jet: nil, stream: nil}, telemetry: signals}
 	for _, header := range []string{"", "Basic " + readFixture, "Bearer wrong"} {
 		response := readRequest(t, api, eventsPath, header, http.StatusUnauthorized)
