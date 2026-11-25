@@ -25,6 +25,8 @@ type Event struct {
 }
 
 // Target delivers events from its own durable consumer.
+// Deliver errors that wrap ErrPermanent are stored in PARKED for 30 days and logged.
+// These errors must omit event payload and envelope text, including quoted fields.
 type Target interface {
 	Name() string
 	Deliver(ctx context.Context, e Event) error
@@ -174,6 +176,9 @@ func (r *runner) deliver(ctx context.Context, target runnerTarget, message jetst
 			hook = logPermanent
 		}
 
+		// Ack first so a permanent failure is never redelivered. A failed park publish is logged
+		// at error level and counted by event_gateway_park_publish_failed_total.
+		// The event stays readable in EVENTS.
 		hook(ctx, target.Name(), event, err)
 	}
 

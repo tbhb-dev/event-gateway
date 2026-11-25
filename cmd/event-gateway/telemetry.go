@@ -21,10 +21,13 @@ const serviceName = "event-gateway"
 // The caller supplies the providers, so nothing here reads the environment.
 // A nil provider falls back to a no-op one.
 type telemetry struct {
-	logger     *slog.Logger
-	tracer     trace.Tracer
-	ingest     metric.Int64Counter
-	parked     metric.Int64Counter
+	logger *slog.Logger
+	tracer trace.Tracer
+	ingest metric.Int64Counter
+
+	// parked counts successful park publishes. Failed publishes increment parkFailed instead.
+	parked metric.Int64Counter
+	// parkFailed counts failed park publishes, which do not increment parked.
 	parkFailed metric.Int64Counter
 }
 

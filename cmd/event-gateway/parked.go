@@ -3,6 +3,8 @@
 
 package main
 
+// cspell:ignore nonamedreturns
+
 import (
 	"cmp"
 	"context"
@@ -19,13 +21,16 @@ import (
 )
 
 const (
-	parkedStream   = "PARKED"
-	parkedPrefix   = "parked."
-	parkedMaxAge   = 30 * 24 * time.Hour
-	parkTimeout    = 10 * time.Second
-	parkedErrorCap = 512
-	parkedListSize = 100
+	parkedStream     = "PARKED"
+	parkedPrefix     = "parked."
+	parkedMaxAge     = 30 * 24 * time.Hour
+	parkTimeout      = 10 * time.Second
+	parkedErrorCap   = 512
+	parkedListSize   = 100
+	parkedPayloadMin = 8
 )
+
+var errParkedLimit = errors.New("parked list limit must not be negative")
 
 // RuleError identifies the rule that caused a delivery error.
 // Err must be safe to persist and must omit the envelope and payload.
@@ -104,19 +109,13 @@ func newParkedRecord(target string, event Event, deliveryErr error) parkedRecord
 		metadata.Provider, metadata.Event, metadata.Delivery = "", "", ""
 	}
 
-	var rule interface{ ruleName() string }
-
-	var name string
-	if errors.As(deliveryErr, &rule) {
-		name = rule.ruleName()
+	name, message := parkedErrorDetails(deliveryErr)
+	if len(event.Envelope) > 0 {
+		message = strings.ReplaceAll(message, string(event.Envelope), "[redacted]")
 	}
 
-	message := deliveryErr.Error()
-
-	for _, sensitive := range [][]byte{event.Envelope, metadata.Payload} {
-		if len(sensitive) > 0 {
-			message = strings.ReplaceAll(message, string(sensitive), "[redacted]")
-		}
+	if len(metadata.Payload) >= parkedPayloadMin {
+		message = strings.ReplaceAll(message, string(metadata.Payload), "[redacted]")
 	}
 
 	return parkedRecord{
@@ -127,10 +126,26 @@ func newParkedRecord(target string, event Event, deliveryErr error) parkedRecord
 	}
 }
 
+//nolint:nonamedreturns // Recovery sets the message if a delivery error method panics.
+func parkedErrorDetails(deliveryErr error) (name, message string) {
+	defer func() {
+		if recover() != nil {
+			message = ErrPermanent.Error()
+		}
+	}()
+
+	var rule interface{ ruleName() string }
+	if errors.As(deliveryErr, &rule) {
+		name = rule.ruleName()
+	}
+
+	return name, deliveryErr.Error()
+}
+
 //nolint:wrapcheck // Report pull batch errors directly to the caller.
 func listParked(ctx context.Context, stream jetstream.Stream, target string, limit int) ([]parkedRecord, error) {
 	if limit < 0 {
-		return []parkedRecord{}, nil
+		return nil, errParkedLimit
 	}
 
 	//nolint:exhaustruct_v5 // The ordered consumer reads from the oldest retained record.
@@ -169,12 +184,11 @@ func listParked(ctx context.Context, stream jetstream.Stream, target string, lim
 	return records, batch.Error()
 }
 
-//nolint:wrapcheck // Return the target's original delivery error.
 func retryParked(ctx context.Context, store eventStore, target Target, seq uint64) error {
 	message, err := store.stream.GetMsg(ctx, seq)
 	if err != nil {
 		return fmt.Errorf("read event sequence %d from EVENTS: %w", seq, err)
 	}
 
-	return target.Deliver(ctx, Event{Seq: message.Sequence, Envelope: message.Data})
+	return deliverEvent(ctx, target, Event{Seq: message.Sequence, Envelope: message.Data})
 }
