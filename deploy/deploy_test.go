@@ -3,6 +3,8 @@
 
 package deploy_test
 
+// cspell:words tailnet
+
 import (
 	"errors"
 	"os"
@@ -16,12 +18,15 @@ import (
 )
 
 const (
-	digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-	repo   = "ghcr.io/tbhb-dev/event-gateway"
-	pull   = "--pull"
-	never  = "never"
-	hook   = "github_webhook_secret"
-	token  = "tunnel_token"
+	digest        = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	repo          = "ghcr.io/tbhb-dev/event-gateway"
+	pull          = "--pull"
+	never         = "never"
+	hook          = "github_webhook_secret"
+	sessionTokens = "event_gateway_session_tokens"
+	token         = "tunnel_token"
+	bindAddr      = "100.64.0.1"
+	bindEnv       = "EVENT_GATEWAY_SESSION_BIND=" + bindAddr
 )
 
 // result is what one run of up.sh left behind.
@@ -63,10 +68,12 @@ func fixture(t *testing.T) string {
 
 	write("up.sh", string(script), 0o600)
 	write("secrets/"+hook, "", 0o400)
+	write("secrets/"+sessionTokens, "", 0o400)
 	write("secrets/"+token, "", 0o400)
 	write(
 		"docker",
-		"#!/bin/sh\ncd \"${0%/*}\" || exit 1\nprintf '%s\\0' \"${EVENT_GATEWAY_IMAGE:-}\" \"$@\" > record\n",
+		"#!/bin/sh\ncd \"${0%/*}\" || exit 1\n"+
+			"printf '%s\\0' \"${EVENT_GATEWAY_IMAGE:-}\" \"${EVENT_GATEWAY_SESSION_BIND:-}\" \"$@\" > record\n",
 		0o700,
 	)
 	write("sudo", "#!/bin/sh\nexec \"$@\"\n", 0o700)
@@ -114,13 +121,13 @@ func runUp(t *testing.T, mutate func(dir string), env []string, args ...string) 
 	return res
 }
 
-// checkRan expects up.sh to hand docker the image and exactly the Compose arguments.
+// checkRan expects up.sh to hand docker the image, bind address and Compose arguments.
 func checkRan(t *testing.T, env []string, image string, args ...string) {
 	t.Helper()
 
-	res := runUp(t, nil, env, append([]string{image}, args...)...)
+	res := runUp(t, nil, append([]string{bindEnv}, env...), append([]string{image}, args...)...)
 	want := append([]string{
-		image, "compose", "-f", filepath.Join(res.dir, "compose.yaml"), "up", "-d", "--force-recreate",
+		image, bindAddr, "compose", "-f", filepath.Join(res.dir, "compose.yaml"), "up", "-d", "--force-recreate",
 	}, args...)
 
 	if got := strings.Split(strings.TrimSuffix(res.record, "\x00"), "\x00"); res.code != 0 || !slices.Equal(got, want) {
@@ -140,10 +147,16 @@ func TestUpAccepts(t *testing.T) {
 func checkRefused(t *testing.T, mutate func(string), contains string, args ...string) {
 	t.Helper()
 
-	res := runUp(t, mutate, nil, args...)
+	checkEnvRefused(t, mutate, []string{bindEnv}, contains, args...)
+}
+
+func checkEnvRefused(t *testing.T, mutate func(string), env []string, contains string, args ...string) {
+	t.Helper()
+
+	res := runUp(t, mutate, env, args...)
 	if res.code != 2 || res.record != "" || !strings.Contains(res.output, contains) {
-		t.Errorf("up.sh %q: exit %d, docker saw %q, want exit 2 and no run: %s",
-			args, res.code, res.record, res.output)
+		t.Errorf("up.sh %q (env %q): exit %d, docker saw %q, want exit 2 and no run: %s",
+			args, env, res.code, res.record, res.output)
 	}
 }
 
@@ -185,7 +198,7 @@ func TestUpRefusesOtherReferences(t *testing.T) {
 func TestUpRequiresSecrets(t *testing.T) {
 	t.Parallel()
 
-	for _, name := range []string{hook, token} {
+	for _, name := range []string{hook, sessionTokens, token} {
 		path := func(dir string) string { return filepath.Join(dir, "secrets", name) }
 
 		for kind, mutate := range map[string]func(string){
@@ -203,6 +216,32 @@ func TestUpRequiresSecrets(t *testing.T) {
 				checkRefused(t, mutate, "secrets/"+name+" must be", digest)
 			})
 		}
+	}
+}
+
+func TestUpRequiresSessionBind(t *testing.T) {
+	t.Parallel()
+
+	checkEnvRefused(t, nil, nil, "EVENT_GATEWAY_SESSION_BIND must be", digest)
+
+	for name, bind := range map[string]string{
+		"empty":          "",
+		"all interfaces": "0.0.0.0",
+		"ipv6":           "::",
+		"bracketed ipv6": "[::]",
+		"hostname":       "localhost",
+		"whitespace":     "100.64.0.1 100.64.0.2",
+		"newline":        "100.64.0.1\n100.64.0.2",
+		"port":           "1.2.3.4:5",
+		"cidr":           "100.64.0.1/32",
+		"octet range":    "256.0.0.1",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			env := []string{"EVENT_GATEWAY_SESSION_BIND=" + bind}
+			checkEnvRefused(t, nil, env, "EVENT_GATEWAY_SESSION_BIND must be", digest)
+		})
 	}
 }
 
@@ -275,11 +314,17 @@ func TestComposeSettings(t *testing.T) {
 	for block, wants := range map[string][]string{
 		gateway: append([]string{
 			"\n    image: ${EVENT_GATEWAY_IMAGE:?",
-			"\n    command:\n      - serve\n      - -listen\n      - \":8080\"\n      - -github-secret-file\n" +
-				"      - /run/secrets/github_webhook_secret\n      - -store-dir\n      - /data/nats\n",
+			"\n    command:\n      - serve\n      - -listen\n      - \":8080\"\n      - -session-listen\n" +
+				"      - \":8081\"\n      - -read-token-file\n      - /run/secrets/event_gateway_session_tokens\n" +
+				"      - -github-secret-file\n      - /run/secrets/github_webhook_secret\n" +
+				"      - -store-dir\n      - /data/nats\n",
+			"\n    ports:\n      # yamllint disable-line rule:line-length\n      - \"" +
+				"${EVENT_GATEWAY_SESSION_BIND:?set the host address for the session port, for example a tailnet address}" +
+				":8081:8081\"\n",
 			"\n    volumes:\n      - data:/data\n",
 			"\n    secrets:\n      - source: github_webhook_secret\n        uid: \"65532\"\n" +
-				"        gid: \"65532\"\n        mode: 0400\n",
+				"        gid: \"65532\"\n        mode: 0400\n      - source: event_gateway_session_tokens\n" +
+				"        uid: \"65532\"\n        gid: \"65532\"\n        mode: 0400\n",
 			"\n      test: [\"CMD\", \"/event-gateway\", \"healthcheck\"]\n      interval: 30s\n" +
 				"      timeout: 5s\n      retries: 3\n      start_period: 5s\n",
 		}, hardening...),
@@ -304,6 +349,7 @@ func TestComposeSettings(t *testing.T) {
 	for _, want := range []string{
 		"\nname: event-gateway\n", "\nvolumes:\n  data: {}\n",
 		"\n  github_webhook_secret:\n    file: ./secrets/github_webhook_secret\n",
+		"\n  event_gateway_session_tokens:\n    file: ./secrets/event_gateway_session_tokens\n",
 		"\n  tunnel_token:\n    file: ./secrets/tunnel_token\n",
 	} {
 		if !strings.Contains(whole, want) {
@@ -311,9 +357,15 @@ func TestComposeSettings(t *testing.T) {
 		}
 	}
 
+	if strings.Count(whole, "event_gateway_session_tokens:") != 1 ||
+		strings.Contains(tunnel, sessionTokens) || strings.Contains(tunnel, "ports:") {
+		t.Error("session tokens or ports leaked outside gateway")
+	}
+
 	for _, banned := range []string{
-		"ports:", "network_mode", "TUNNEL_TOKEN", "-grafana-secret-file", "-grafana-secret",
-		"-read-listen", "-read-token-file", "labels:", "json-file",
+		":8080:", "8080:8080", "EVENT_GATEWAY_SESSION_BIND:-", "EVENT_GATEWAY_SESSION_BIND-",
+		"network_mode", "TUNNEL_TOKEN", "-grafana-secret-file", "-grafana-secret",
+		"-read-listen", "labels:", "json-file",
 	} {
 		if strings.Contains(whole, banned) {
 			t.Errorf("compose.yaml contains %q", banned)
