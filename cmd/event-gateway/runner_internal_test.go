@@ -201,23 +201,33 @@ func TestRunnerRestart(t *testing.T) {
 func TestRunnerGap(t *testing.T) {
 	t.Parallel()
 
-	store := testStore(t, time.Second)
-	publishRunner(t, store, pullSubject)
+	store := testStore(t, retention)
 
 	events := make(chan Event, 4)
 	run := &runner{stream: store.stream, targets: []runnerTarget{{
 		Target: recordingTarget("gap", events), Start: startPosition{all: true},
 	}}}
 	stop := startRunner(t, run)
+
+	publishRunner(t, store, pullSubject)
 	expectRunner(t, events, 1)
 	stop()
 
+	// Shorten the expiry only now so the first delivery cannot race it.
+	info, err := store.stream.Info(t.Context())
+	checkError(t, err)
+
+	config := info.Config
+	config.MaxAge, config.Duplicates = time.Second, time.Second
+	_, err = store.jet.UpdateStream(t.Context(), config)
+	checkError(t, err)
+
 	publishRunner(t, store, pullSubject)
 	waitRunner(t, func() bool {
-		info, err := store.stream.Info(t.Context())
-		checkError(t, err)
+		current, infoErr := store.stream.Info(t.Context())
+		checkError(t, infoErr)
 
-		return info.State.FirstSeq == 3
+		return current.State.FirstSeq == 3
 	})
 
 	stop = startRunner(t, run)
