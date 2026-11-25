@@ -54,6 +54,8 @@ func run(ctx context.Context, out io.Writer, logHandler slog.Handler, args []str
 		return serve(ctx, out, logHandler, args[1:])
 	case healthcheckCommand:
 		return healthcheck(ctx, args[1:])
+	case parkedCommand:
+		return runParked(ctx, out, args[1:], requestParked)
 	default:
 		return errUsage
 	}

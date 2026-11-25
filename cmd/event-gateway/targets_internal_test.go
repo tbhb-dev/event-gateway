@@ -100,12 +100,14 @@ func TestServeStartsConfiguredRunner(t *testing.T) {
 
 	t.Cleanup(func() { delete(targetTypes, fakeType) })
 
+	t.Chdir(t.TempDir())
+
 	for name, data := range map[string]string{"registered": fixtureNewTarget, "empty": `{"targets":[]}`} {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
 			args := []string{
 				"-targets=" + writeTargets(t, data), "-listen=127.0.0.1",
-				storeDirFlag + dir, "-github-secret=" + fixtureKey,
+				storeDirFlag + dir, "-github-secret=" + fixtureKey, "-parked-socket=s",
 			}
 			err := serve(t.Context(), io.Discard, slog.DiscardHandler, args)
 			_, listenErr := errors.AsType[*net.AddrError](err)

@@ -26,6 +26,7 @@ const (
 const (
 	readListenFlag    = "read-listen"
 	readTokenFileFlag = "read-token-file"
+	defaultStoreDir   = "/data/nats"
 )
 
 var (
@@ -49,6 +50,7 @@ type serveConfig struct {
 	listen     string
 	storeDir   string
 	targets    string
+	parkedPath string
 	bodyCap    int
 	maxMemory  int64
 	maxStore   int64
@@ -62,7 +64,8 @@ func (cfg *serveConfig) parse(out io.Writer, args []string) error {
 	flags.StringVar(&cfg.readListen, readListenFlag, "", "private read API listen address")
 	flags.StringVar(&cfg.wsListen, "session-listen", "", "private session listen address")
 	flags.StringVar(&cfg.tokenFile, readTokenFileFlag, "", "read API bearer token hash file")
-	flags.StringVar(&cfg.storeDir, "store-dir", "/data/nats", "JetStream data directory")
+	flags.StringVar(&cfg.storeDir, "store-dir", defaultStoreDir, "JetStream data directory")
+	flags.StringVar(&cfg.parkedPath, "parked-socket", os.Getenv(parkedSocketEnv), "parked API socket path")
 	flags.StringVar(&cfg.targets, "targets", "", "routing targets JSON file")
 	flags.Func("github-secret", "GitHub webhook secret (overrides file and environment)", func(value string) error {
 		cfg.secret = &value
@@ -198,6 +201,15 @@ func serve(ctx context.Context, out io.Writer, logHandler slog.Handler, args []s
 		return err
 	}
 
+	return cfg.withParked(ctx, targets, func(parked parkedService) error {
+		return cfg.start(ctx, logHandler, targets, &tokens, handler, grafana, parked)
+	})
+}
+
+func (cfg *serveConfig) start(
+	ctx context.Context, logHandler slog.Handler, targets []runnerTarget, tokens *readTokens,
+	handler *githubWebhook, grafana *grafanaWebhook, parked parkedService,
+) error {
 	options := storeOptions(cfg.storeDir)
 	options.JetStreamMaxMemory = cfg.maxMemory
 	options.JetStreamMaxStore = cfg.maxStore
@@ -222,15 +234,15 @@ func serve(ctx context.Context, out io.Writer, logHandler slog.Handler, args []s
 	webhook := gatewayHTTP(cfg.listen, withGrafana(grafana, handler, store, signals))
 
 	return runWithTargets(ctx, store, signals, targets, func(ctx context.Context) error {
-		return cfg.runHTTP(ctx, &tokens, store, signals, webhook)
+		return cfg.runHTTP(ctx, tokens, store, signals, append(parked(store), webhook))
 	})
 }
 
 func (cfg *serveConfig) runHTTP(
-	ctx context.Context, tokens *readTokens, store eventStore, signals telemetry, webhook *http.Server,
+	ctx context.Context, tokens *readTokens, store eventStore, signals telemetry, servers []httpService,
 ) error {
 	if cfg.readListen == "" {
-		return runHTTPServer(ctx, webhook)
+		return runHTTP(ctx, nil, signals.logger, servers...)
 	}
 
 	api := readAPI{tokens: tokens, store: store, telemetry: signals}
@@ -243,15 +255,25 @@ func (cfg *serveConfig) runHTTP(
 
 		defer sessions.active.Wait()
 
-		return runHTTP(ctx, tokens, signals.logger, webhook, reader, server)
+		return runHTTP(ctx, tokens, signals.logger, append(servers, reader, server)...)
 	}
 
-	return runHTTP(ctx, tokens, signals.logger, webhook, reader)
+	return runHTTP(ctx, tokens, signals.logger, append(servers, reader)...)
 }
 
-func gatewayHTTP(address string, handler http.Handler) *http.Server {
+type httpService struct {
+	*http.Server
+
+	serve func() error
+}
+
+type parkedService func(eventStore) []httpService
+
+func noParkedService(eventStore) []httpService { return nil }
+
+func gatewayHTTP(address string, handler http.Handler) httpService {
 	//nolint:exhaustruct_v5 // The gateway sets the address, handler, and timeouts it needs.
-	return &http.Server{
+	server := &http.Server{
 		Addr:                         address,
 		Handler:                      handler,
 		DisableGeneralOptionsHandler: true,
@@ -259,14 +281,22 @@ func gatewayHTTP(address string, handler http.Handler) *http.Server {
 		ReadTimeout:                  readTimeout,
 		WriteTimeout:                 writeTimeout,
 	}
+
+	return httpService{Server: server, serve: server.ListenAndServe}
 }
 
-func runHTTP(ctx context.Context, tokens *readTokens, logger *slog.Logger, servers ...*http.Server) error {
+func runHTTP(ctx context.Context, tokens *readTokens, logger *slog.Logger, servers ...httpService) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
+	var tick <-chan time.Time
+
+	if tokens != nil {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+
+		tick = ticker.C
+	}
 
 	stopped := make(chan error, len(servers))
 	for _, server := range servers {
@@ -284,7 +314,7 @@ func runHTTP(ctx context.Context, tokens *readTokens, logger *slog.Logger, serve
 		case result := <-stopped:
 			err = errors.Join(err, result)
 			remaining--
-		case <-ticker.C:
+		case <-tick:
 			tokens.reload(ctx, logger)
 		}
 	}
@@ -292,7 +322,7 @@ func runHTTP(ctx context.Context, tokens *readTokens, logger *slog.Logger, serve
 	return err
 }
 
-func runHTTPServer(ctx context.Context, httpServer *http.Server) error {
+func runHTTPServer(ctx context.Context, httpServer httpService) error {
 	done := make(chan error, 1)
 	stop := context.AfterFunc(ctx, func() {
 		shutdown, cancel := context.WithTimeout(context.WithoutCancel(ctx), shutdownTimeout)
@@ -301,7 +331,7 @@ func runHTTPServer(ctx context.Context, httpServer *http.Server) error {
 		done <- errors.Join(httpServer.Shutdown(shutdown), httpServer.Close())
 	})
 
-	err := httpServer.ListenAndServe()
+	err := httpServer.serve()
 	if stop() {
 		return fmt.Errorf("serve HTTP: %w", err)
 	}
