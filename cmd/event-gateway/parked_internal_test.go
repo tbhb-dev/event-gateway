@@ -68,10 +68,12 @@ func TestParkedStreamConfig(t *testing.T) {
 func TestParkedRecord(t *testing.T) {
 	t.Parallel()
 
+	const delivery = "delivery-1"
+
 	ctx := t.Context()
 	store := testStore(t, retention)
 	stream := testParkedStream(t, store)
-	req := signedRequest(ctx, issuesEvent, "delivery-1", parkedPayloadJSON)
+	req := signedRequest(ctx, issuesEvent, delivery, parkedPayloadJSON)
 	testWebhook(t, store, defaultBodyCap).ServeHTTP(httptest.NewRecorder(), req)
 
 	stored, readErr := store.stream.GetMsg(ctx, 1)
@@ -91,7 +93,7 @@ func TestParkedRecord(t *testing.T) {
 			name: "wrapped-rule", event: valid,
 			err: fmt.Errorf("delivery: %w", RuleError{Rule: "select", Err: bodyErr}),
 			want: parkedRecord{
-				Rule: "select", Provider: parkedFixtureProvider, Event: issuesEvent, Delivery: "delivery-1",
+				Rule: "select", Provider: parkedFixtureProvider, Event: issuesEvent, Delivery: delivery,
 				Error: "delivery: permanent: [redacted] [redacted]",
 			},
 		},
@@ -100,6 +102,32 @@ func TestParkedRecord(t *testing.T) {
 			event: Event{Envelope: []byte(`{"provider":"github","event":5,"delivery":"delivery-1"}`), Seq: 2},
 			err:   errLongParked,
 			want:  parkedRecord{Error: strings.Repeat("x", 512)},
+		},
+		{
+			name:  "short-payload",
+			event: Event{Envelope: []byte(`{"payload":0}`)},
+			err:   fmt.Errorf("%w: status 400", ErrPermanent),
+			want:  parkedRecord{Error: "permanent: status 400"},
+		},
+		{
+			name:  "eight-byte-payload",
+			event: Event{Envelope: []byte(`{"payload":12345678}`)},
+			err:   fmt.Errorf("%w: 12345678 12345678", ErrPermanent),
+			want:  parkedRecord{Error: "permanent: [redacted] [redacted]"},
+		},
+		{
+			name: "typed-nil-error", event: valid,
+			err: (*json.SyntaxError)(nil),
+			want: parkedRecord{
+				Provider: parkedFixtureProvider, Event: issuesEvent, Delivery: delivery, Error: ErrPermanent.Error(),
+			},
+		},
+		{
+			name: "empty-rule-error", event: valid,
+			err: RuleError{},
+			want: parkedRecord{
+				Provider: parkedFixtureProvider, Event: issuesEvent, Delivery: delivery, Error: ErrPermanent.Error(),
+			},
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -205,7 +233,6 @@ func TestListParked(t *testing.T) {
 		{target: firstTarget, want: []uint64{1, 3}},
 		{want: []uint64{1, 2, 3}},
 		{limit: 2, want: []uint64{1, 2}},
-		{limit: -1},
 	} {
 		records, err := listParked(ctx, stream, test.target, test.limit)
 		checkError(t, err)
@@ -217,7 +244,9 @@ func TestListParked(t *testing.T) {
 		}
 	}
 
-	_, err := listParked(ctx, parkedPullStream{Stream: stream}, "", 0)
+	_, err := listParked(ctx, stream, "", -1)
+	checkEqual(t, errors.Is(err, errParkedLimit), true)
+	_, err = listParked(ctx, parkedPullStream{Stream: stream}, "", 0)
 	checkEqual(t, errors.Is(err, errRetryDelivery), true)
 	_, err = store.jet.Publish(ctx, "parked.one", []byte("invalid JSON"))
 	checkError(t, err)
@@ -265,9 +294,11 @@ func TestRetryParked(t *testing.T) {
 		want        error
 		seq         uint64
 		calls       int
+		panics      bool
 	}{
 		{seq: 2, calls: 1},
 		{seq: 2, calls: 1, deliveryErr: errRetryDelivery, want: errRetryDelivery},
+		{seq: 2, calls: 1, panics: true, want: ErrPermanent},
 		{seq: 1, want: jetstream.ErrMsgNotFound},
 		{seq: 3, want: jetstream.ErrMsgNotFound},
 	} {
@@ -277,6 +308,10 @@ func TestRetryParked(t *testing.T) {
 
 			checkEqual(t, event.Seq, test.seq)
 			checkEqual(t, string(event.Envelope), testEnvelope)
+
+			if test.panics {
+				panic(testEnvelope)
+			}
 
 			return test.deliveryErr
 		}}
