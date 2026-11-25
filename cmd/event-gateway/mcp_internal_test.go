@@ -4,12 +4,14 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
 	"maps"
+	"net/http"
 	"os"
 	"slices"
 	"strings"
@@ -17,8 +19,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+)
+
+const (
+	mcpTestTimeout = 10 * time.Second
+	mcpTestInit    = `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{` +
+		`"clientInfo":{"name":"claude-code","version":"test"},"protocolVersion":"2025-11-25","capabilities":{}}}` + "\n"
 )
 
 func TestMCPCommand(t *testing.T) {
@@ -57,6 +66,200 @@ func TestMCPCommand(t *testing.T) {
 
 	err := run(t.Context(), io.Discard, slog.DiscardHandler, []string{mcpCommand, "unexpected"})
 	checkEqual(t, errors.Is(err, errMCPUsage), true)
+}
+
+//nolint:paralleltest // The gateway fixture sets process-wide environment variables.
+func TestMCPStdinErrors(t *testing.T) {
+	t.Setenv(gatewayURLEnv, "")
+	t.Setenv(gatewayTokenEnv, "")
+
+	for _, test := range []struct {
+		want        error
+		name, input string
+	}{
+		{io.ErrUnexpectedEOF, "truncated", `{"jsonrpc":"2.0"`},
+		{nil, "malformed JSON", "{!\n"},
+		{nil, "invalid protocol", "{}\n"},
+		{os.ErrClosed, "closed stdin", ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			input, client := mcpTestPipe(t)
+			_, err := io.WriteString(client, test.input)
+			checkError(t, err)
+			checkError(t, client.Close())
+
+			if errors.Is(test.want, os.ErrClosed) {
+				checkError(t, input.Close())
+			}
+
+			ctx, cancel := context.WithTimeout(t.Context(), mcpTestTimeout)
+			defer cancel()
+
+			err = serveMCP(ctx, slog.DiscardHandler, input, io.Discard)
+			checkMCPServeError(t, err)
+
+			if test.want != nil {
+				checkEqual(t, errors.Is(err, test.want), true)
+			}
+		})
+	}
+}
+
+type failingMCPWriter struct{}
+
+func (failingMCPWriter) Write([]byte) (int, error) { return 0, io.ErrShortWrite }
+
+func TestMCPStdoutError(t *testing.T) {
+	t.Setenv(gatewayURLEnv, "")
+	t.Setenv(gatewayTokenEnv, "")
+
+	input, client := mcpTestPipe(t)
+	_, err := io.WriteString(client, mcpTestInit)
+	checkError(t, err)
+
+	ctx, cancel := context.WithTimeout(t.Context(), mcpTestTimeout)
+	defer cancel()
+
+	err = serveMCP(ctx, slog.DiscardHandler, input, failingMCPWriter{})
+	checkMCPServeError(t, err)
+	checkEqual(t, errors.Is(err, io.ErrShortWrite), true)
+}
+
+func TestMCPStdoutAfterCancel(t *testing.T) {
+	t.Parallel()
+
+	done := make(chan struct{})
+	close(done)
+
+	out := mcpStdout{writer: failingMCPWriter{}, done: done}
+	n, err := out.Write([]byte("notification"))
+	checkEqual(t, n, 0)
+	checkEqual(t, err, io.ErrClosedPipe)
+}
+
+//nolint:paralleltest // The gateway fixture sets process-wide environment variables.
+func TestMCPStdinCloseStopsGateway(t *testing.T) {
+	checkMCPBlockedStdout(t, false)
+}
+
+//nolint:paralleltest // The gateway fixture sets process-wide environment variables.
+func TestMCPMalformedInputWithBlockedStdout(t *testing.T) {
+	checkMCPBlockedStdout(t, true)
+}
+
+func checkMCPBlockedStdout(t *testing.T, malformed bool) {
+	t.Helper()
+
+	ctx := t.Context()
+	disconnected := make(chan struct{})
+	gateway, _ := fakeMCPGateway(t, []int{http.StatusSwitchingProtocols}, func(conn *websocket.Conn) {
+		defer close(disconnected)
+
+		receiveGatewayHello(ctx, t, conn, "", "")
+		checkError(t, conn.Write(ctx, websocket.MessageText, []byte(`{"type":"gap","from":3,"to":5}`)))
+		_, _, err := conn.Read(ctx)
+		checkEqual(t, err != nil, true)
+	})
+	t.Setenv(gatewayURLEnv, gateway.URL+sessionPath)
+	t.Setenv(gatewayTokenEnv, mcpFixture)
+
+	setMCPStateKeys(t, [3]string{})
+
+	input, clientInput := mcpTestPipe(t)
+	clientOutput, output := io.Pipe()
+
+	t.Cleanup(func() { checkError(t, clientOutput.Close()) })
+	t.Cleanup(func() { checkError(t, output.Close()) })
+
+	stopped := make(chan error, 1)
+	go func() { stopped <- serveMCP(ctx, slog.DiscardHandler, input, output) }()
+
+	started := make(chan error, 1)
+	go func() { started <- startMCPPipeClient(clientInput, clientOutput) }()
+
+	select {
+	case err := <-started:
+		checkError(t, err)
+	case <-time.After(mcpTestTimeout):
+		t.Fatal("gateway notification never started writing to stdout")
+	}
+
+	if malformed {
+		// Keep stdin open so only the SDK's parser error can start shutdown.
+		_, err := io.WriteString(clientInput, "{!\n")
+		checkError(t, err)
+	} else {
+		checkError(t, clientInput.Close())
+	}
+
+	select {
+	case err := <-stopped:
+		if malformed {
+			checkMCPServeError(t, err)
+			_, syntaxErr := errors.AsType[*json.SyntaxError](err)
+			checkEqual(t, syntaxErr, true)
+		} else {
+			checkError(t, err)
+		}
+	case <-time.After(mcpTestTimeout):
+		t.Fatal("MCP server did not return after stdin ended the session with stdout blocked")
+	}
+
+	select {
+	case <-disconnected:
+	case <-time.After(mcpTestTimeout):
+		t.Fatal("MCP gateway stayed connected after the server returned")
+	}
+}
+
+func startMCPPipeClient(input io.Writer, output io.Reader) error {
+	_, err := io.WriteString(input, mcpTestInit)
+	if err != nil {
+		return err //nolint:wrapcheck // Report the pipe error to the test.
+	}
+
+	_, err = bufio.NewReader(output).ReadBytes('\n')
+	if err != nil {
+		return err //nolint:wrapcheck // Report the pipe error to the test.
+	}
+
+	_, err = io.WriteString(input, `{"jsonrpc":"2.0","method":"notifications/initialized"}`+"\n")
+	if err != nil {
+		return err //nolint:wrapcheck // Report the pipe error to the test.
+	}
+
+	// Read only the first byte so the notification stays blocked in the pipe write.
+	var firstByte [1]byte
+
+	_, err = io.ReadFull(output, firstByte[:])
+
+	return err //nolint:wrapcheck // Report the pipe error to the test.
+}
+
+func mcpTestPipe(t *testing.T) (*os.File, *os.File) {
+	t.Helper()
+
+	reader, writer, err := os.Pipe()
+	checkError(t, err)
+
+	for _, file := range []*os.File{reader, writer} {
+		t.Cleanup(func() {
+			closeErr := file.Close()
+			if !errors.Is(closeErr, os.ErrClosed) {
+				checkError(t, closeErr)
+			}
+		})
+	}
+
+	return reader, writer
+}
+
+func checkMCPServeError(t *testing.T, err error) {
+	t.Helper()
+
+	checkEqual(t, errors.Unwrap(err) != nil, true)
+	checkEqual(t, strings.HasPrefix(err.Error(), "serve MCP: "), true)
+	checkEqual(t, errors.Is(err, context.DeadlineExceeded), false)
 }
 
 func connectMCP(t *testing.T) *mcp.ClientSession {
