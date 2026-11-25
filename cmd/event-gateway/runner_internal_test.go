@@ -202,15 +202,22 @@ func TestRunnerGap(t *testing.T) {
 	t.Parallel()
 
 	store := testStore(t, time.Second)
-	publishRunner(t, store, pullSubject)
 
 	events := make(chan Event, 4)
-	run := &runner{stream: store.stream, targets: []runnerTarget{{
+	ready := make(chan struct{})
+	run := &runner{stream: store.stream, ready: ready, targets: []runnerTarget{{
 		Target: recordingTarget("gap", events), Start: startPosition{all: true},
 	}}}
 	stop := startRunner(t, run)
+
+	// Publish only once the consumer exists so a slow start cannot outlive the stream's expiry.
+	receiveRunner(t, ready)
+	publishRunner(t, store, pullSubject)
 	expectRunner(t, events, 1)
 	stop()
+
+	// The runner closes ready once, so the restart must not reuse it.
+	run.ready = nil
 
 	publishRunner(t, store, pullSubject)
 	waitRunner(t, func() bool {
