@@ -123,6 +123,10 @@ func (r *Runner) Run(ctx context.Context, command Command) (Result, error) {
 
 	//nolint:gosec // The executable is matched against the allow-list above.
 	cmd := exec.CommandContext(ctx, command.Executable, command.Args...)
+	// CommandContext may have replaced the path, as Windows does by appending an
+	// executable extension, so run the exact approved file.
+	cmd.Path = command.Executable
+	cmd.Err = nil
 	cmd.Dir = command.Dir
 	cmd.Stdout = &out
 	cmd.Stderr = &out

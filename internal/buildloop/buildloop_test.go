@@ -81,7 +81,9 @@ func self(t *testing.T) string {
 func uncleaned(t *testing.T) string {
 	t.Helper()
 
-	return filepath.Dir(self(t)) + "/./" + filepath.Base(self(t))
+	sep := string(filepath.Separator)
+
+	return filepath.Dir(self(t)) + sep + "." + sep + filepath.Base(self(t))
 }
 
 func missing() string {
@@ -197,8 +199,8 @@ func TestNewRunnerRejectsUnfixedPaths(t *testing.T) {
 		{name: "dot relative", allowed: "./tool"},
 		{name: "nested relative", allowed: "bin/tool"},
 		{name: "parent relative", allowed: "../tool"},
-		{name: "uncleaned absolute", allowed: "/usr/bin/../bin/tool"},
-		{name: "trailing slash", allowed: "/usr/bin/tool/"},
+		{name: "uncleaned absolute", allowed: uncleaned(t)},
+		{name: "trailing separator", allowed: self(t) + string(filepath.Separator)},
 		{name: "empty", allowed: ""},
 	}
 
@@ -315,5 +317,35 @@ func TestRunCancelled(t *testing.T) {
 	_, err := newRunner(t, self(t)).Run(ctx, helperCommand(t, 0, modeSleep))
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("Run() error = %v, want context.Canceled", err)
+	}
+}
+
+// TestRunExactFilename checks that an allowed path with no extension never
+// starts a different file, as Windows would by appending an executable extension.
+func TestRunExactFilename(t *testing.T) {
+	t.Parallel()
+
+	data, err := os.ReadFile(self(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+
+	const mode = 0o700
+
+	//nolint:gosec // The path is inside the test's own temporary directory.
+	err = os.WriteFile(filepath.Join(dir, "tool.exe"), data, mode)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	bare := filepath.Join(dir, "tool")
+	command := helperCommand(t, 0, modeExit, "0")
+	command.Executable = bare
+
+	got, err := newRunner(t, bare).Run(t.Context(), command)
+	if err == nil || isNotAllowed(err) || got.Output != "" {
+		t.Errorf("Run() = %q, %v, want a start error and no output", got.Output, err)
 	}
 }
