@@ -168,10 +168,12 @@ func serve(ctx context.Context, out io.Writer, logHandler slog.Handler, args []s
 		return err
 	}
 
-	targets, err := loadTargets(cfg.targets, targetTypes)
+	targets, closeTargets, err := loadTargets(cfg.targets, targetTypes)
 	if err != nil {
 		return err
 	}
+
+	defer closeTargets()
 
 	var tokens readTokens
 	if cfg.readListen != "" {

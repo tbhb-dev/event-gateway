@@ -71,6 +71,16 @@ type configError string
 
 func (e configError) Error() string { return string(e) }
 
+// TargetError identifies the validated target name when its configuration fails.
+type TargetError struct {
+	err  error
+	Name string
+}
+
+func (e TargetError) Error() string { return e.err.Error() }
+
+func (e TargetError) Unwrap() error { return e.err }
+
 // Load decodes and validates a JSON routing configuration.
 func Load(data []byte) (Config, error) {
 	object, err := readObject(data, "targets")
@@ -125,17 +135,20 @@ func loadTarget(name string, object map[string]json.RawMessage) (Target, error) 
 
 	start, err := parseStart(object["start"])
 	if err != nil {
-		return Target{}, err
+		return Target{}, TargetError{err: err, Name: name}
 	}
 
 	connection := object["connection"]
 	if connection != nil && !bytes.HasPrefix(connection, []byte("{")) {
-		return Target{}, configError("connection must be a JSON object")
+		return Target{}, TargetError{err: configError("connection must be a JSON object"), Name: name}
 	}
 
 	rules, err := loadEntries(object["rules"], "rule", loadRule, "name", "match", "action")
+	if err != nil {
+		return Target{}, TargetError{err: err, Name: name}
+	}
 
-	return Target{Name: name, Type: kind, Start: start, Connection: connection, Rules: rules}, err
+	return Target{Name: name, Type: kind, Start: start, Connection: connection, Rules: rules}, nil
 }
 
 func loadRule(name string, object map[string]json.RawMessage) (Rule, error) {

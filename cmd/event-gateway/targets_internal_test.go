@@ -4,7 +4,7 @@
 //nolint:exhaustruct_v5 // Fixtures use zero defaults for fields unrelated to the case.
 package main
 
-// cspell:words eventfields
+// cspell:words eventfields temporaltarget
 
 import (
 	"context"
@@ -24,12 +24,15 @@ import (
 
 	"go.tbhb.dev/event-gateway/internal/eventfields"
 	"go.tbhb.dev/event-gateway/internal/routing"
+	"go.tbhb.dev/event-gateway/internal/temporaltarget"
 )
 
 const ruleMatch = `"match":{"provider":"github","event":"pull_request",` +
 	`"repository":["example/repo"],"action":["opened"]}`
 
 const (
+	targetsFlag    = "-targets"
+	receiverName   = "receiver"
 	fakeType       = "fake"
 	firstRule      = "first"
 	fixtureTargets = `{"targets":[{"name":"receiver","type":"` + fakeType + `","start":"all","rules":[` +
@@ -40,6 +43,39 @@ const (
 
 const ruleEnvelope = `{"provider":"github","event":"pull_request","delivery":"fixture","repository":"Example/Repo",
 	"payload":{"action":"opened"}}`
+
+const (
+	temporalConnection = `{"host_port":"temporal.example:7233","namespace":"default"}`
+	temporalAction     = `{"kind":"start","task_queue":"events","workflow_type":"ProcessEvent",` +
+		`"workflow_id":"event-{{.seq}}","id_reuse":"reject_duplicate"}`
+	temporalEntry = `{"name":"workflow","type":"temporal","connection":` + temporalConnection +
+		`,"rules":[{"name":"start-event",` + ruleMatch + `,"action":` + temporalAction + `}]}`
+	temporalTargets = `{"targets":[` + temporalEntry + `]}`
+)
+
+type fakeTemporalClient struct {
+	temporaltarget.Client
+
+	starts []temporaltarget.StartRequest
+	closed int
+}
+
+func (client *fakeTemporalClient) Start(_ context.Context, req temporaltarget.StartRequest) error {
+	client.starts = append(client.starts, req)
+
+	return nil
+}
+
+func (client *fakeTemporalClient) Close() { client.closed++ }
+
+func useTemporalDial(t *testing.T, dial func(temporaltarget.Connection) (temporalClient, error)) {
+	t.Helper()
+
+	original := dialTemporal
+	dialTemporal = dial
+
+	t.Cleanup(func() { dialTemporal = original })
+}
 
 type actorFunc func(routing.Rule, eventfields.Fields, []byte) error
 
@@ -86,7 +122,7 @@ func TestServeTargets(t *testing.T) {
 				path = writeTargets(t, test.data)
 			}
 
-			args := []string{"-targets", path, "-github-secret=" + fixtureKey, storeDirFlag}
+			args := []string{targetsFlag, path, "-github-secret=" + fixtureKey, storeDirFlag}
 			err := serve(t.Context(), io.Discard, slog.DiscardHandler, args)
 			checkEqual(t, errors.Is(err, test.want), true)
 			checkEqual(t, strings.Contains(err.Error(), "private-fixture"), false)
@@ -96,34 +132,154 @@ func TestServeTargets(t *testing.T) {
 
 //nolint:paralleltest // Serve uses the process-wide target registry.
 func TestServeStartsConfiguredRunner(t *testing.T) {
-	targetTypes[fakeType] = func(routing.Target) (actor, error) { return actorFunc(nil), nil }
+	targetTypes[fakeType] = func(routing.Target) (actor, func(), error) { return actorFunc(nil), nil, nil }
 
 	t.Cleanup(func() { delete(targetTypes, fakeType) })
 
-	for name, data := range map[string]string{"registered": fixtureNewTarget, "empty": `{"targets":[]}`} {
-		t.Run(name, func(t *testing.T) {
+	for _, test := range []struct {
+		name, data, consumer string
+		dials                int
+	}{
+		{name: "registered", data: fixtureNewTarget, consumer: receiverName},
+		{name: "empty", data: `{"targets":[]}`, consumer: receiverName},
+		{name: "temporal", data: temporalTargets, consumer: "workflow", dials: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := new(fakeTemporalClient)
+			dials := 0
+
+			useTemporalDial(t, func(temporaltarget.Connection) (temporalClient, error) {
+				dials++
+
+				return client, nil
+			})
+
 			dir := t.TempDir()
 			args := []string{
-				"-targets=" + writeTargets(t, data), "-listen=127.0.0.1",
+				"-targets=" + writeTargets(t, test.data), "-listen=127.0.0.1",
 				storeDirFlag + dir, "-github-secret=" + fixtureKey,
 			}
 			err := serve(t.Context(), io.Discard, slog.DiscardHandler, args)
 			_, listenErr := errors.AsType[*net.AddrError](err)
 			checkEqual(t, listenErr, true)
+			checkEqual(t, dials, test.dials)
+			checkEqual(t, client.closed, test.dials)
 
 			store, stop, err := openStore(t.Context(), storeOptions(dir), retention)
 			checkError(t, err)
 			t.Cleanup(stop)
 
 			_, parkedErr := store.jet.Stream(t.Context(), parkedStream)
-			_, consumerErr := store.stream.Consumer(t.Context(), "receiver")
+			_, consumerErr := store.stream.Consumer(t.Context(), test.consumer)
 
-			if name == "empty" {
+			if test.name == "empty" {
 				checkEqual(t, errors.Is(parkedErr, jetstream.ErrStreamNotFound), true)
 				checkEqual(t, errors.Is(consumerErr, jetstream.ErrConsumerNotFound), true)
 			} else {
 				checkError(t, parkedErr)
 				checkError(t, consumerErr)
+			}
+		})
+	}
+}
+
+//nolint:paralleltest // The Temporal dialer is shared by serve.
+func TestTemporalTargetDelivery(t *testing.T) {
+	client := new(fakeTemporalClient)
+
+	useTemporalDial(t, func(connection temporaltarget.Connection) (temporalClient, error) {
+		checkEqual(t, connection, temporaltarget.Connection{HostPort: "temporal.example:7233", Namespace: "default"})
+
+		return client, nil
+	})
+
+	targets, closeTargets, err := loadTargets(writeTargets(t, temporalTargets), targetTypes)
+	checkError(t, err)
+
+	defer closeTargets()
+
+	checkEqual(t, len(targets), 1)
+	checkEqual(t, client.closed, 0)
+	checkError(t, targets[0].Deliver(t.Context(), Event{Seq: 42, Envelope: []byte(ruleEnvelope)}))
+	checkEqual(t, len(client.starts), 1)
+
+	start := client.starts[0]
+	checkEqual(t, start.WorkflowID, "event-42")
+	checkEqual(t, start.TaskQueue, "events")
+	checkEqual(t, start.WorkflowType, "ProcessEvent")
+	checkEqual(t, start.IDReuse, temporaltarget.RejectDuplicate)
+	checkEqual(t, string(start.Input),
+		`{"delivery":"fixture","event":"pull_request","fields":{"action":"opened","head_sha":null,"label":null,`+
+			`"number":null,"sender":null},"provider":"github","received_at":"","repository":"Example/Repo",`+
+			`"rule":"start-event","seq":42,"target":"workflow"}`)
+}
+
+//nolint:paralleltest // The Temporal dialer is shared by serve.
+func TestTemporalTargetErrors(t *testing.T) {
+	badAction := strings.Replace(temporalTargets, temporalAction, `{"kind":"private-fixture"}`, 1)
+	later := strings.Replace(temporalEntry, `"name":"workflow"`, `"name":"later"`, 1)
+
+	for _, test := range []struct {
+		name, data, want string
+		failDial         bool
+		closes           int
+	}{
+		{
+			name: "bad connection",
+			data: strings.Replace(temporalTargets, temporalConnection, `{"host_port":"private-fixture"}`, 1),
+			want: `configure target "workflow": parse Temporal connection: invalid host_port`,
+		},
+		{
+			name: "connection shape",
+			data: strings.Replace(temporalTargets, temporalConnection, `"private-fixture"`, 1),
+			want: `configure target "workflow": invalid targets file`,
+		},
+		{
+			name: "action shape",
+			data: strings.Replace(temporalTargets, temporalAction, `"private-fixture"`, 1),
+			want: `configure target "workflow": invalid targets file`,
+		},
+		{
+			name: "bad action", data: badAction, closes: 1,
+			want: `configure target "workflow": invalid Temporal rule action`,
+		},
+		{
+			name: "dial failure", data: temporalTargets, failDial: true,
+			want: `configure target "workflow": dial Temporal failed`,
+		},
+		{
+			name: "later unknown type", closes: 1,
+			data: `{"targets":[` + temporalEntry + `,` + strings.Replace(later, `"temporal"`, `"other"`, 1) + `]}`,
+			want: `unknown target type "other"`,
+		},
+		{
+			name: "later bad action", closes: 2,
+			data: `{"targets":[` + temporalEntry + `,` + strings.Replace(later, temporalAction, `{}`, 1) + `]}`,
+			want: `configure target "later": invalid Temporal rule action`,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var clients []*fakeTemporalClient
+
+			useTemporalDial(t, func(temporaltarget.Connection) (temporalClient, error) {
+				if test.failDial {
+					return nil, &os.PathError{Op: "dial", Path: "private-fixture", Err: errRetryDelivery}
+				}
+
+				client := new(fakeTemporalClient)
+				clients = append(clients, client)
+
+				return client, nil
+			})
+
+			args := []string{targetsFlag, writeTargets(t, test.data)}
+			err := serve(t.Context(), io.Discard, slog.DiscardHandler, args)
+			checkEqual(t, err != nil, true)
+			checkEqual(t, err.Error(), test.want)
+			checkEqual(t, len(clients), test.closes)
+
+			for _, client := range clients {
+				checkEqual(t, client.closed, 1)
 			}
 		})
 	}
@@ -141,19 +297,20 @@ func TestTargetStartPositions(t *testing.T) {
 		path := writeTargets(t, strings.Replace(fixtureTargets, `"all"`, `"`+start+`"`, 1))
 
 		var cfg serveConfig
-		checkError(t, cfg.parse(io.Discard, []string{"-targets", path}))
-		targets, err := loadTargets(cfg.targets, map[string]func(routing.Target) (actor, error){
-			fakeType: func(routing.Target) (actor, error) { return actorFunc(nil), nil },
+		checkError(t, cfg.parse(io.Discard, []string{targetsFlag, path}))
+		targets, closeTargets, err := loadTargets(cfg.targets, map[string]targetFactory{
+			fakeType: func(routing.Target) (actor, func(), error) { return actorFunc(nil), nil, nil },
 		})
 		checkError(t, err)
+		closeTargets()
 		checkEqual(t, len(targets), 1)
-		checkEqual(t, targets[0].Name(), "receiver")
+		checkEqual(t, targets[0].Name(), receiverName)
 		checkEqual(t, slices.Equal(targets[0].Subjects, []string{pullSubject}), true)
 		checkEqual(t, reflect.DeepEqual(targets[0].Start, want), true)
 	}
 
-	_, err := loadTargets(writeTargets(t, fixtureTargets), map[string]func(routing.Target) (actor, error){
-		fakeType: func(routing.Target) (actor, error) { return nil, errRetryDelivery },
+	_, _, err := loadTargets(writeTargets(t, fixtureTargets), map[string]targetFactory{
+		fakeType: func(routing.Target) (actor, func(), error) { return nil, nil, errRetryDelivery },
 	})
 	checkEqual(t, errors.Is(err, errRetryDelivery), true)
 }
@@ -220,16 +377,18 @@ func TestRunWithTargets(t *testing.T) {
 
 	store := testStore(t, retention)
 	calls := make(chan uint64, 2)
-	targets, loadErr := loadTargets(writeTargets(t, fixtureTargets), map[string]func(routing.Target) (actor, error){
-		fakeType: func(routing.Target) (actor, error) {
+	targets, closeTargets, loadErr := loadTargets(writeTargets(t, fixtureTargets), map[string]targetFactory{
+		fakeType: func(routing.Target) (actor, func(), error) {
 			return actorFunc(func(_ routing.Rule, fields eventfields.Fields, _ []byte) error {
 				calls <- fields.Seq
 
 				return actorError(true)
-			}), nil
+			}), nil, nil
 		},
 	})
 	checkError(t, loadErr)
+
+	defer closeTargets()
 
 	for _, data := range []string{strings.Replace(ruleEnvelope, "opened", "closed", 1), ruleEnvelope} {
 		_, err := store.jet.Publish(ctx, pullSubject, []byte(data))
@@ -258,7 +417,7 @@ func TestRunWithTargets(t *testing.T) {
 	records, err := listParked(t.Context(), stream, "", 0)
 	checkError(t, err)
 	checkEqual(t, len(records), 1)
-	checkEqual(t, records[0].Target, "receiver")
+	checkEqual(t, records[0].Target, receiverName)
 	checkEqual(t, records[0].Rule, firstRule)
 	checkEqual(t, records[0].Seq, uint64(2))
 }
@@ -271,16 +430,18 @@ func TestRunWithNewTarget(t *testing.T) {
 
 	store := testStore(t, retention)
 	calls := make(chan Event, 2)
-	targets, err := loadTargets(writeTargets(t, fixtureNewTarget), map[string]func(routing.Target) (actor, error){
-		fakeType: func(routing.Target) (actor, error) {
+	targets, closeTargets, err := loadTargets(writeTargets(t, fixtureNewTarget), map[string]targetFactory{
+		fakeType: func(routing.Target) (actor, func(), error) {
 			return actorFunc(func(_ routing.Rule, fields eventfields.Fields, envelope []byte) error {
 				calls <- Event{Seq: fields.Seq, Envelope: envelope}
 
 				return nil
-			}), nil
+			}), nil, nil
 		},
 	})
 	checkError(t, err)
+
+	defer closeTargets()
 
 	signals := newTelemetry(slog.DiscardHandler, nil, nil)
 	err = runWithTargets(ctx, store, signals, targets, func(ctx context.Context) error {
@@ -349,7 +510,7 @@ func TestRunWithTargetsStartupCancellation(t *testing.T) {
 
 	store := testStore(t, retention)
 	signals := newTelemetry(slog.DiscardHandler, nil, nil)
-	targets := []runnerTarget{{Target: cancelTarget{Target: fakeTarget{name: "receiver"}, cancel: cancel}}}
+	targets := []runnerTarget{{Target: cancelTarget{Target: fakeTarget{name: receiverName}, cancel: cancel}}}
 	called := false
 	err := runWithTargets(ctx, store, signals, targets, func(context.Context) error {
 		called = true
