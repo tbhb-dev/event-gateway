@@ -3,6 +3,7 @@ event-gateway
 Bazel
 prek
 subcommand
+(?:MCP|mcp)
 x_defs
 prd
 hibernatable
