@@ -23,7 +23,6 @@ import (
 const (
 	pushEvent        = "push"
 	pong             = "pong"
-	unsupported      = "resume_after and import are not supported yet"
 	pushSubscription = `{"provider":"github","event":"push","repository":"example/repo"}`
 )
 
@@ -131,8 +130,6 @@ func checkSessionCommands(ctx context.Context, t *testing.T, conn *websocket.Con
 		{`[]`, codeKey, badFrame, ""},
 		{`{"type":"hello","subscriptions":[{"provider":"github"}]}`, codeKey, "bad_subscription", ""},
 		{`{"type":"hello","resume_after":0}`, codeKey, badFrame, ""},
-		{`{"type":"hello","import":{}}`, "message", unsupported, ""},
-		{`{"type":"hello","resume_after":0,"import":true}`, codeKey, badFrame, ""},
 		{`{"type":"hello","more":3,"id":"` + maxID + `x"}`, codeKey, badFrame, ""},
 		{`{"type":"hello","subscriptions":{}}`, codeKey, badFrame, ""},
 		{`{"type":"hello","subscriptions":[` + strings.Repeat(`{},`, subscriptionLimit-1) + `{}]}`, codeKey, "limit", ""},
@@ -140,9 +137,12 @@ func checkSessionCommands(ctx context.Context, t *testing.T, conn *websocket.Con
 		checkEqual(t, string(checkSessionReply(ctx, t, conn, trial.send, trial.key, trial.want)["id"]), trial.id)
 	}
 
+	importReply := checkSessionReply(ctx, t, conn, `{"type":"hello","import":true}`, codeKey, badFrame)
+	checkEqual(t, string(importReply["message"]), `"import is allowed only in the first hello frame"`)
+
 	limit := session{stream: nil, conn: nil, events: make(chan jetstream.Msg), subscriptions: nil, replay: nil}
 	subs := `[` + strings.Repeat(pushSubscription+",", subscriptionLimit-1) + pushSubscription + `]`
-	reply := limit.hello(ctx, sessionObject{"more": json.RawMessage("true"), subsKey: json.RawMessage(subs)})
+	reply := limit.hello(ctx, sessionObject{"more": json.RawMessage(jsonTrue), subsKey: json.RawMessage(subs)})
 	checkEqual(t, reply == nil, true)
 	checkEqual(t, len(limit.subscriptions), subscriptionLimit)
 }
@@ -338,7 +338,77 @@ func TestSessionResumeMissingTail(t *testing.T) {
 	server = sessionReplayServer(t, store)
 	conn = dialSession(ctx, t, server.URL)
 	checkSessionReply(ctx, t, conn, hello, typeKey, helloKind)
+	gap := checkSessionReply(ctx, t, conn, "", typeKey, "gap")
+	checkEqual(t, string(gap["from"]), "1")
+	checkEqual(t, string(gap["to"]), "3")
 	checkCaughtUp(ctx, t, conn, "3")
+	publishSessionEvent(t, hook, pushEvent, "live")
+	checkSessionReply(ctx, t, conn, "", "seq", "4")
+}
+
+func TestSessionImport(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(t.Context(), shutdownTimeout)
+	defer cancel()
+
+	store := testStore(t, retention)
+	hook := testWebhook(t, store, defaultBodyCap)
+	server := sessionReplayServer(t, store)
+	conn := dialSession(ctx, t, server.URL)
+
+	for _, invalid := range []string{`false`, `null`, `"true"`, `{}`} {
+		reply := checkSessionReply(ctx, t, conn, `{"type":"hello","import":`+invalid+`}`, codeKey, badFrame)
+		checkEqual(t, string(reply["message"]), `"import must be true"`)
+	}
+
+	reply := checkSessionReply(ctx, t, conn, `{"type":"hello","resume_after":0,"import":true}`, codeKey, badFrame)
+	checkEqual(t, string(reply["message"]), `"import and resume_after are mutually exclusive"`)
+
+	publishSessionEvent(t, hook, pushEvent, "expired")
+	publishSessionEvent(t, hook, pushEvent, "first")
+	publishSessionEvent(t, hook, issuesEvent, "unmatched-between")
+	publishSessionEvent(t, hook, pushEvent, "second")
+	publishSessionEvent(t, hook, issuesEvent, "unmatched-tail")
+	checkError(t, store.stream.DeleteMsg(ctx, 1))
+
+	const (
+		start = `{"type":"hello","import":true,"more":true}`
+		final = `{"type":"hello","subscriptions":[` + pushSubscription + `]}`
+		ping  = `{"type":"ping"}`
+	)
+
+	checkError(t, conn.Write(ctx, websocket.MessageText, []byte(start)))
+	checkSessionReply(ctx, t, conn, ping, typeKey, pong)
+	publishSessionEvent(t, hook, pushEvent, "live")
+
+	checkSessionReply(ctx, t, conn, final, subsKey, "1")
+	checkSessionReply(ctx, t, conn, "", "seq", "2")
+	checkSessionReply(ctx, t, conn, "", "seq", "4")
+	checkCaughtUp(ctx, t, conn, "5")
+	checkSessionReply(ctx, t, conn, "", "seq", "6")
+	checkSessionReply(ctx, t, conn, ping, typeKey, pong)
+}
+
+func TestSessionImportWithoutSubscriptions(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(t.Context(), shutdownTimeout)
+	defer cancel()
+
+	store := testStore(t, retention)
+	hook := testWebhook(t, store, defaultBodyCap)
+	server := sessionReplayServer(t, store)
+
+	const hello = `{"type":"hello","import":true}`
+
+	for _, seq := range []string{"0", "1"} {
+		conn := dialSession(ctx, t, server.URL)
+		checkSessionReply(ctx, t, conn, hello, subsKey, "0")
+		checkCaughtUp(ctx, t, conn, seq)
+		publishSessionEvent(t, hook, pushEvent, seq)
+		checkSessionReply(ctx, t, conn, `{"type":"ping"}`, typeKey, pong)
+	}
 }
 
 func checkSessionHandshakes(t *testing.T, api *sessionAPI) {

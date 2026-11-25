@@ -37,6 +37,7 @@ const (
 	typeKey           = "type"
 	subsKey           = "subscriptions"
 	resumeKey         = "resume_after"
+	jsonTrue          = "true"
 	idLimit           = 64
 )
 
@@ -227,13 +228,15 @@ func errorReply(code, msg string) sessionReply {
 }
 
 func (s *session) hello(ctx context.Context, object sessionObject) sessionReply {
+	if reply := s.importError(object); reply != nil {
+		return reply
+	}
+
 	more := string(object["more"])
 	raw := sessionJSON[[]json.RawMessage](object[subsKey])
 
 	switch {
-	case object["import"] != nil:
-		return errorReply(badFrame, "resume_after and import are not supported yet")
-	case more != "" && more != "true" && more != "false", object[subsKey] != nil && raw == nil:
+	case more != "" && more != jsonTrue && more != "false", object[subsKey] != nil && raw == nil:
 		return errorReply(badFrame, "invalid hello fields")
 	case len(s.subscriptions)+len(raw) > subscriptionLimit:
 		return errorReply("limit", "too many subscriptions")
@@ -266,38 +269,62 @@ func (s *session) hello(ctx context.Context, object sessionObject) sessionReply 
 
 	// Creating the consumer sets the live boundary. The run loop starts
 	// receiving its events after the final hello, once all filters are known.
-	if s.events == nil && !s.consume(ctx, resume) {
+	if s.events == nil && !s.consume(ctx, resume, object["import"] != nil) {
 		return errorReply("internal", "stream unavailable")
 	}
 
 	s.subscriptions = subs
 
-	if more == "true" {
+	if more == jsonTrue {
 		return nil
 	}
 
 	return sessionReply{typeKey: helloKind, subsKey: len(subs)}
 }
 
-func (s *session) consume(ctx context.Context, resume *uint64) bool {
+func (s *session) importError(object sessionObject) sessionReply {
+	switch value := string(object["import"]); {
+	case value == "":
+		return nil
+	case value != jsonTrue:
+		return errorReply(badFrame, "import must be true")
+	case object[resumeKey] != nil:
+		return errorReply(badFrame, "import and resume_after are mutually exclusive")
+	case s.events != nil:
+		return errorReply(badFrame, "import is allowed only in the first hello frame")
+	default:
+		return nil
+	}
+}
+
+func (s *session) consume(ctx context.Context, resume *uint64, importing bool) bool {
 	//nolint:exhaustruct_v5 // Use the default ordered consumer configuration.
 	config := jetstream.OrderedConsumerConfig{
 		DeliverPolicy: jetstream.DeliverNewPolicy, InactiveThreshold: shutdownTimeout, MaxResetAttempts: 1,
 	}
 
+	var after uint64
+
+	switch {
+	case resume != nil:
+		after = *resume
+		config.DeliverPolicy = jetstream.DeliverByStartSequencePolicy
+		// Saturate the start at MaxUint64 so it cannot wrap into retained history.
+		config.OptStartSeq = min(after, math.MaxUint64-1) + 1
+	case importing:
+		config.DeliverPolicy = jetstream.DeliverAllPolicy
+	}
+
 	var replay *sessionReplay
 
-	if resume != nil {
+	if importing || resume != nil {
 		info, err := s.stream.Info(ctx)
 		if err != nil {
 			return false
 		}
 
 		replay = &sessionReplay{last: info.State.LastSeq, gap: nil, pending: false}
-		config.DeliverPolicy = jetstream.DeliverByStartSequencePolicy
-		// Saturate the start at MaxUint64 so it cannot wrap into retained history.
-		config.OptStartSeq = min(*resume, math.MaxUint64-1) + 1
-		if info.State.Msgs != 0 && config.OptStartSeq < info.State.FirstSeq {
+		if resume != nil && info.State.LastSeq != 0 && config.OptStartSeq < info.State.FirstSeq {
 			replay.gap = sessionReply{typeKey: "gap", "from": config.OptStartSeq, "to": info.State.FirstSeq - 1}
 			config.OptStartSeq = info.State.FirstSeq
 		}
@@ -309,7 +336,7 @@ func (s *session) consume(ctx context.Context, resume *uint64) bool {
 	}
 
 	if replay != nil {
-		replay.pending = *resume < replay.last && consumer.CachedInfo().NumPending != 0
+		replay.pending = after < replay.last && consumer.CachedInfo().NumPending != 0
 		s.replay = replay
 	}
 
