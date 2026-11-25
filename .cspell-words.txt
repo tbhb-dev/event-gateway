@@ -209,3 +209,6 @@ resourcepb
 sdklog
 traceexport
 tracepb
+errorlint
+forcetypeassert
+musttag
