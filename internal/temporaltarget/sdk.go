@@ -138,6 +138,7 @@ func mapSDKError(err error) error {
 		return fmt.Errorf("%w: Temporal workflow missing", ErrNotFound)
 	case errors.As(err, new(*serviceerror.Unavailable)), errors.As(err, new(*serviceerror.ResourceExhausted)),
 		errors.As(err, new(*serviceerror.DeadlineExceeded)), errors.As(err, new(*serviceerror.Canceled)),
+		errors.As(err, new(*serviceerror.Aborted)), errors.As(err, new(*serviceerror.Internal)),
 		errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
 		return fmt.Errorf("%w: Temporal request failed", ErrTransient)
 	default:

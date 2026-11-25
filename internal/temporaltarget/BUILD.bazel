@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright Tony Burns
-# cspell:words eventfields temporaltarget
+# cspell:words devserver eventfields rlocationpath temporaltarget
 
 load("@rules_go//go:def.bzl", "go_library", "go_test")
 load("@tbhb_rules//repo:defs.bzl", "repo_files")
 load("@tbhb_rules_go//:defs.bzl", "gobco_test")
+
+# gazelle:exclude devserver_internal_test.go
 
 repo_files()
 
@@ -55,5 +57,35 @@ go_test(
         "@io_temporal_go_sdk//client",
         "@io_temporal_go_sdk//converter",
         "@io_temporal_go_sdk//temporal",
+    ],
+)
+
+alias(
+    name = "temporal_cli",
+    actual = select({
+        "@bazel_tools//src/conditions:darwin_arm64": "@temporal_darwin_arm64//:temporal",
+        "@bazel_tools//src/conditions:darwin_x86_64": "@temporal_darwin_amd64//:temporal",
+        "@bazel_tools//src/conditions:linux_aarch64": "@temporal_linux_arm64//:temporal",
+        "@bazel_tools//src/conditions:linux_x86_64": "@temporal_linux_amd64//:temporal",
+        "@bazel_tools//src/conditions:windows_x64": "@temporal_windows_amd64//:temporal.exe",
+    }),
+)
+
+go_test(
+    name = "temporaltarget_devserver_test",
+    size = "large",
+    srcs = ["devserver_internal_test.go"],
+    data = [":temporal_cli"],
+    embed = [":temporaltarget"],
+    env = {"TEMPORAL_CLI": "$(rlocationpath :temporal_cli)"},
+    visibility = ["//:__pkg__"],
+    deps = [
+        "//internal/eventfields",
+        "//internal/routing",
+        "@io_temporal_go_api//serviceerror",
+        "@io_temporal_go_sdk//client",
+        "@io_temporal_go_sdk//temporal",
+        "@io_temporal_go_sdk//worker",
+        "@io_temporal_go_sdk//workflow",
     ],
 )
