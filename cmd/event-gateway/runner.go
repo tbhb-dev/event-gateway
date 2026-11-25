@@ -57,6 +57,7 @@ type runnerTarget struct {
 type runner struct {
 	onPermanent func(context.Context, string, Event, error)
 	stream      jetstream.Stream
+	ready       chan struct{}
 	targets     []runnerTarget
 	retryBase   time.Duration
 	possibleGap atomic.Uint64
@@ -75,6 +76,10 @@ func (r *runner) run(ctx context.Context) error {
 		}
 
 		consumers[index] = consumer
+	}
+
+	if r.ready != nil {
+		close(r.ready)
 	}
 
 	var loops sync.WaitGroup

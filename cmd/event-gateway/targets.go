@@ -158,7 +158,12 @@ func runWithTargets(
 	defer cancel()
 
 	//nolint:exhaustruct_v5 // The runner uses the default retry base and a fresh gap counter.
-	run := runner{stream: store.stream, targets: targets, onPermanent: parkHook(store.jet, signals, 0)}
+	run := runner{
+		stream:      store.stream,
+		targets:     targets,
+		onPermanent: parkHook(store.jet, signals, 0),
+		ready:       make(chan struct{}),
+	}
 	stopped := make(chan error, 1)
 
 	go func() {
@@ -166,6 +171,19 @@ func runWithTargets(
 
 		cancel()
 	}()
+
+	select {
+	case runErr := <-stopped:
+		return runErr
+	case <-run.ready:
+	}
+
+	// Cancellation can arrive as the runner signals readiness.
+	select {
+	case <-ctx.Done():
+		return <-stopped
+	default:
+	}
 
 	httpErr := serveHTTP(ctx)
 
