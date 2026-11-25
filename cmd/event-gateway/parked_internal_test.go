@@ -36,6 +36,21 @@ const (
 
 var errLongParked = errors.New(strings.Repeat("x", 512) + "overflow")
 
+//nolint:usetesting // Use a short root for Unix socket paths.
+func shortSocketDir(t *testing.T) string {
+	t.Helper()
+
+	dir, err := os.MkdirTemp("/tmp", "eg-")
+	if err != nil {
+		dir, err = os.MkdirTemp("", "eg-")
+		checkError(t, err)
+	}
+
+	t.Cleanup(func() { checkError(t, os.RemoveAll(dir)) })
+
+	return dir
+}
+
 //nolint:ireturn // Return the actual JetStream stream to the tests.
 func testParkedStream(t *testing.T, store eventStore) jetstream.Stream {
 	t.Helper()

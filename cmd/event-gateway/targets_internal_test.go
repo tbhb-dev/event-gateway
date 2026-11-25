@@ -100,7 +100,7 @@ func TestServeStartsConfiguredRunner(t *testing.T) {
 
 	t.Cleanup(func() { delete(targetTypes, fakeType) })
 
-	t.Chdir(t.TempDir())
+	t.Chdir(shortSocketDir(t))
 
 	for name, data := range map[string]string{"registered": fixtureNewTarget, "empty": `{"targets":[]}`} {
 		t.Run(name, func(t *testing.T) {
