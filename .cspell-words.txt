@@ -218,3 +218,7 @@ tracepb
 errorlint
 forcetypeassert
 musttag
+facebookgo
+objx
+robfig
+stretchr
