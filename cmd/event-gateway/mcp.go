@@ -11,8 +11,10 @@ import (
 	"log/slog"
 	"reflect"
 	"slices"
+	"strings"
 	"sync"
 
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"go.tbhb.dev/event-gateway/internal/filter"
@@ -23,18 +25,38 @@ const (
 	subscribeTool         = "subscribe"
 	unsubscribeTool       = "unsubscribe"
 	listSubscriptionsTool = "list_subscriptions"
+	checkDeliveryTool     = "check_delivery"
+	noArgumentsSchema     = `{"type":"object","additionalProperties":false}`
+	channelCapability     = "claude/channel"
+	channelMethod         = "notifications/claude/channel"
+	channelEventKey       = "event"
+	channelProviderKey    = "provider"
+	channelRepositoryKey  = "repository"
+	channelTruncated      = "true"
+	claudeCodeClient      = "claude-code"
+	mcpServerName         = "event-gateway"
+	maxChannelContent     = 64 * 1024
+	maxChannelAttribute   = 256
 )
 
-var errMCPUsage = errors.New("usage: event-gateway mcp")
+var (
+	errMCPUsage      = errors.New("usage: event-gateway mcp")
+	errNoConnection  = errors.New("no MCP connection")
+	errChannelClient = errors.New("channel delivery requires a claude-code client")
+)
+
+//nolint:gochecknoglobals // Reuse the same immutable framing escapes for every notification.
+var channelFraming = strings.NewReplacer("<", `\u003c`, ">", `\u003e`, "&", `\u0026`)
 
 func runMCP(ctx context.Context, logHandler slog.Handler, args []string) error {
 	if len(args) != 0 {
 		return errMCPUsage
 	}
 
-	server := newMCPServer(slog.New(logHandler), new(mcpSubscriptions))
+	notifier := &notifyingTransport{inner: &mcp.StdioTransport{MaxLineLength: 0}, conn: nil, mu: sync.Mutex{}}
+	server := newMCPServer(slog.New(logHandler), new(mcpSubscriptions), notifier)
 
-	err := server.Run(ctx, &mcp.StdioTransport{MaxLineLength: 0})
+	err := server.Run(ctx, notifier)
 	if err != nil {
 		return fmt.Errorf("serve MCP: %w", err)
 	}
@@ -42,14 +64,17 @@ func runMCP(ctx context.Context, logHandler slog.Handler, args []string) error {
 	return nil
 }
 
-func newMCPServer(logger *slog.Logger, subs *mcpSubscriptions) *mcp.Server {
+func newMCPServer(logger *slog.Logger, subs *mcpSubscriptions, notifier *notifyingTransport) *mcp.Server {
 	//nolint:exhaustruct_v5 // Keep SDK defaults for unused protocol features.
-	server := mcp.NewServer(&mcp.Implementation{Name: "event-gateway", Version: version}, &mcp.ServerOptions{
-		Logger: logger,
+	server := mcp.NewServer(&mcp.Implementation{Name: mcpServerName, Version: version}, &mcp.ServerOptions{
+		Logger:       logger,
+		Instructions: "After a restart or reconnect, call check_delivery and confirm both events arrive: self_test and echo.",
 		Capabilities: &mcp.ServerCapabilities{
-			Logging: &mcp.LoggingCapabilities{}, //nolint:staticcheck // Advertise logging for the negotiated protocols.
-			Tools:   &mcp.ToolCapabilities{},
+			Experimental: map[string]any{channelCapability: map[string]any{}},
+			Logging:      &mcp.LoggingCapabilities{}, //nolint:staticcheck // Advertise logging for the negotiated protocols.
+			Tools:        &mcp.ToolCapabilities{},
 		},
+		// These versions use initialize, which supplies the client's name.
 		SupportedProtocolVersions: []string{"2025-11-25", "2025-06-18", "2025-03-26"},
 	})
 
@@ -66,12 +91,162 @@ func newMCPServer(logger *slog.Logger, subs *mcpSubscriptions) *mcp.Server {
 	//nolint:exhaustruct_v5 // Only the tool name, description and input schema are needed.
 	mcp.AddTool(server, &mcp.Tool{
 		Name: listSubscriptionsTool, Description: "List this session's subscriptions.",
-		InputSchema: json.RawMessage(`{"type":"object","additionalProperties":false}`),
+		InputSchema: json.RawMessage(noArgumentsSchema),
 	}, func(context.Context, *mcp.CallToolRequest, json.RawMessage) (*mcp.CallToolResult, any, error) {
 		return nil, map[string][]filter.Subscription{subsKey: subs.list()}, nil
 	})
+	//nolint:exhaustruct_v5 // Only the tool name, description and input schema are needed.
+	mcp.AddTool(server, &mcp.Tool{
+		Name: checkDeliveryTool,
+		Description: "Send a self-test event and confirm it reaches this session. " +
+			"This proves delivery to the client over stdio but does not prove the gateway connection.",
+		InputSchema: json.RawMessage(noArgumentsSchema),
+	}, notifier.checkDelivery)
 
 	return server
+}
+
+// notifyingTransport retains the SDK connection so it can write custom
+// notifications. The SDK has no public API for sending them, but the
+// connection can write a JSON-RPC request with no ID.
+type notifyingTransport struct {
+	inner mcp.Transport
+	conn  mcp.Connection
+	mu    sync.Mutex
+}
+
+//nolint:ireturn // Implement mcp.Transport.
+func (t *notifyingTransport) Connect(ctx context.Context) (mcp.Connection, error) {
+	conn, err := t.inner.Connect(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("connect MCP transport: %w", err)
+	}
+
+	t.mu.Lock()
+	t.conn = conn
+	t.mu.Unlock()
+
+	return conn, nil
+}
+
+func (t *notifyingTransport) Notify(ctx context.Context, method string, params json.RawMessage) error {
+	t.mu.Lock()
+	conn := t.conn
+	t.mu.Unlock()
+
+	if conn == nil {
+		return errNoConnection
+	}
+
+	//nolint:wrapcheck // Preserve the connection's write error.
+	return conn.Write(ctx, &jsonrpc.Request{ID: jsonrpc.ID{}, Method: method, Params: params, Extra: nil})
+}
+
+type channelEvent struct {
+	repository *string
+	provider   string
+	event      string
+	delivery   string
+	payload    json.RawMessage
+}
+
+type channelParameters struct {
+	Meta    map[string]string `json:"meta"`
+	Content string            `json:"content"`
+}
+
+func channelParams(event channelEvent) channelParameters {
+	meta := map[string]string{
+		channelProviderKey: channelAttribute(event.provider),
+		channelEventKey:    channelAttribute(event.event),
+		"delivery":         channelAttribute(event.delivery),
+	}
+	if event.repository != nil {
+		meta[channelRepositoryKey] = channelAttribute(*event.repository)
+	}
+
+	object := sessionJSON[map[string]json.RawMessage](event.payload)
+
+	var action *string
+
+	if json.Unmarshal(object["action"], &action) == nil && action != nil {
+		meta["action"] = channelAttribute(*action)
+	}
+
+	if len(event.payload) > maxChannelContent {
+		meta["truncated"] = channelTruncated
+		content := fmt.Sprintf("%s %s (action '%s'): payload of %d bytes omitted.",
+			meta[channelProviderKey], meta[channelEventKey], meta["action"], len(event.payload))
+
+		return channelParameters{Meta: meta, Content: content}
+	}
+
+	return channelParameters{Meta: meta, Content: channelFraming.Replace(string(event.payload))}
+}
+
+func channelAttribute(value string) string {
+	return channelFraming.Replace(strings.ToValidUTF8(value[:min(len(value), maxChannelAttribute)], ""))
+}
+
+func (t *notifyingTransport) deliverChannel(ctx context.Context, session *mcp.ServerSession, event channelEvent) error {
+	params := session.InitializeParams()
+	if params == nil || params.ClientInfo == nil || params.ClientInfo.Name != claudeCodeClient {
+		return errChannelClient
+	}
+
+	//nolint:errcheck,errchkjson // The params contain only strings and a string map.
+	data, _ := json.Marshal(channelParams(event))
+
+	return t.Notify(ctx, channelMethod, data)
+}
+
+func (t *notifyingTransport) checkDelivery(
+	ctx context.Context, req *mcp.CallToolRequest, _ json.RawMessage,
+) (*mcp.CallToolResult, any, error) {
+	for _, event := range []string{"self_test", "echo"} {
+		err := t.deliverChannel(ctx, req.Session, channelEvent{
+			provider: mcpServerName, event: event, delivery: "", repository: nil,
+			payload: json.RawMessage(`{"message":"Local stdio delivery test"}`),
+		})
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+
+	return nil, map[string]string{"status": "Sent self_test and echo over stdio."}, nil
+}
+
+type channelNotice struct {
+	Level string `json:"level"`
+	Text  string `json:"text"`
+}
+
+func gatewayConnectionLost() channelNotice {
+	return channelNotice{Level: "warning", Text: "Gateway connection lost."}
+}
+
+func gatewayReconnected() channelNotice {
+	return channelNotice{Level: "info", Text: "Gateway reconnected."}
+}
+
+func gatewayGap(from, to uint64) channelNotice {
+	return channelNotice{
+		Level: "warning",
+		Text:  fmt.Sprintf("Gateway events %d through %d are no longer available.", from, to),
+	}
+}
+
+func (t *notifyingTransport) deliverNotice(
+	ctx context.Context,
+	session *mcp.ServerSession,
+	notice channelNotice,
+) error {
+	//nolint:errcheck,errchkjson // The notice contains only strings.
+	payload, _ := json.Marshal(notice)
+
+	return t.deliverChannel(ctx, session, channelEvent{
+		provider: mcpServerName, event: "notice", delivery: "", repository: nil, payload: payload,
+	})
 }
 
 func subscriptionSchema(required string) json.RawMessage {
