@@ -138,11 +138,17 @@ func (state mcpState) write(subs []filter.Subscription) bool {
 		return false
 	}
 
-	return replaceMCPState(root, file, temp, state.file, data)
+	return replaceMCPState(root, file, temp, state.file, data, file.Write)
 }
 
-func replaceMCPState(root *os.Root, file *os.File, temp, target string, data []byte) bool {
-	_, err := file.Write(data)
+func replaceMCPState(
+	root *os.Root,
+	file *os.File,
+	temp, target string,
+	data []byte,
+	write func([]byte) (int, error),
+) bool {
+	_, err := write(data)
 	if errors.Join(err, file.Sync(), file.Close()) == nil && root.Rename(temp, target) == nil {
 		return true
 	}

@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -206,9 +207,11 @@ func TestMCPStateTempWriteFailure(t *testing.T) {
 
 	const temp = "temp"
 
-	file, err := root.OpenFile(temp, os.O_CREATE|os.O_EXCL|os.O_RDONLY, 0o600)
+	file, err := root.OpenFile(temp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	checkError(t, err)
-	checkEqual(t, replaceMCPState(root, file, temp, "target", []byte("data")), false)
+
+	write := func([]byte) (int, error) { return 0, io.ErrShortWrite }
+	checkEqual(t, replaceMCPState(root, file, temp, "target", []byte("data"), write), false)
 	_, err = root.Stat(temp)
 	checkEqual(t, os.IsNotExist(err), true)
 }
