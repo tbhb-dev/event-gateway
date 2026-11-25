@@ -5,15 +5,17 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/coder/websocket"
 	"github.com/nats-io/nats.go/jetstream"
+
+	"go.tbhb.dev/event-gateway/internal/filter"
 )
 
 const (
@@ -48,21 +50,7 @@ func exerciseSession(t *testing.T, read readAPI, hook *githubWebhook, consumer j
 	chunk := `{"type":"hello","more":true,"subscriptions":[` + pushSubscription + `]}`
 	checkError(t, conn.Write(ctx, websocket.MessageText, []byte(chunk)))
 
-	for _, trial := range []struct{ send, key, want, id string }{
-		{`{"type":"ping"}`, typeKey, pong, ""},
-		{`{"type": "ping"}`, typeKey, pong, ""},
-		{`{"type":"ping","id":"p1"}`, typeKey, pong, `"p1"`},
-		{"{\"type\":\"ping\"}\n", typeKey, pong, ""},
-		{`[]`, codeKey, badFrame, ""},
-		{`{"type":"hello","subscriptions":[{"provider":"github"}]}`, codeKey, "bad_subscription", ""},
-		{`{"type":"hello","resume_after":0}`, "message", unsupported, ""},
-		{`{"type":"hello","import":{}}`, "message", unsupported, ""},
-		{`{"type":"hello","more":3,"id":"` + strings.Repeat("x", 65) + `"}`, codeKey, badFrame, ""},
-		{`{"type":"hello","subscriptions":{}}`, codeKey, badFrame, ""},
-		{`{"type":"hello","subscriptions":[` + strings.Repeat(`{},`, subscriptionLimit-1) + `{}]}`, codeKey, "limit", ""},
-	} {
-		checkEqual(t, string(checkSessionReply(ctx, t, conn, trial.send, trial.key, trial.want)["id"]), trial.id)
-	}
+	checkSessionCommands(ctx, t, conn)
 
 	expectStatus(t, hook.ServeHTTP, signedRequest(ctx, "issues", "filtered", body), http.StatusAccepted)
 	expectStatus(t, hook.ServeHTTP, signedRequest(ctx, pushEvent, "between", body), http.StatusAccepted)
@@ -70,17 +58,18 @@ func exerciseSession(t *testing.T, read readAPI, hook *githubWebhook, consumer j
 	checkSessionReply(ctx, t, conn, `{"type":"hello","id":"ready","more":false}`, "id", "ready")
 	checkSessionReply(ctx, t, conn, "", "seq", "16")
 
-	for _, kind := range []websocket.MessageType{websocket.MessageText, websocket.MessageBinary} {
-		checkError(t, conn.Write(ctx, kind, []byte(`{"type":"hello"}`)))
-		checkSessionReply(ctx, t, conn, "", codeKey, badFrame)
+	for _, trial := range []struct {
+		id   string
+		kind websocket.MessageType
+	}{{`"late"`, websocket.MessageText}, {"", websocket.MessageBinary}} {
+		checkError(t, conn.Write(ctx, trial.kind, []byte(`{"type":"hello","id":"late"}`)))
+		checkEqual(t, string(checkSessionReply(ctx, t, conn, "", codeKey, badFrame)["id"]), trial.id)
 	}
 
-	other := dialSession(ctx, t, server.URL)
-	checkError(t, other.Write(ctx, websocket.MessageText, []byte(strings.Repeat("x", 4097))))
-	checkClose(ctx, t, other, websocket.StatusMessageTooBig, "")
+	checkSessionFrameLimit(ctx, t, conn, server.URL)
 
 	idle := dialSession(ctx, t, server.URL)
-	checkError(t, os.WriteFile(api.tokens.path, nil, 0o600))
+	writeReadTokens(t, api.tokens.path, "second", "second-fixture")
 	api.tokens.reload(ctx, api.telemetry.logger)
 	expectStatus(t, hook.ServeHTTP, signedRequest(ctx, pushEvent, "revoked", body), http.StatusAccepted)
 	checkClose(ctx, t, conn, tokenRevoked, "token revoked")
@@ -96,7 +85,9 @@ func exerciseSession(t *testing.T, read readAPI, hook *githubWebhook, consumer j
 	read.store.jet.Conn().Close()
 
 	peer := session{stream: read.store.stream, conn: nil, events: nil, subscriptions: nil}
-	checkEqual(t, peer.hello(ctx, nil)["message"], "stream unavailable")
+	reply := peer.hello(ctx, nil)
+	checkEqual(t, reply["message"], "stream unavailable")
+	checkEqual(t, reply[codeKey], "internal")
 
 	read.store.stream = readFetchStream{Stream: read.store.stream, consumer: consumer}
 	failed := httptest.NewServer(http.HandlerFunc(newSessionAPI(read, helloTimeout).connect))
@@ -106,6 +97,74 @@ func exerciseSession(t *testing.T, read readAPI, hook *githubWebhook, consumer j
 	socket = dialSession(ctx, t, failed.URL)
 	checkSessionReply(ctx, t, socket, `{"type":"hello"}`, typeKey, helloKind)
 	checkClose(ctx, t, socket, websocket.StatusInternalError, "delivery failed")
+}
+
+func checkSessionFrameLimit(ctx context.Context, t *testing.T, conn *websocket.Conn, url string) {
+	t.Helper()
+
+	const ping = `{"type":"ping"}`
+
+	checkSessionReply(ctx, t, conn, ping+strings.Repeat(" ", sessionFrameLimit-len(ping)), typeKey, pong)
+	other := dialSession(ctx, t, url)
+	checkError(t, other.Write(ctx, websocket.MessageText, []byte(strings.Repeat("x", sessionFrameLimit+1))))
+	checkClose(ctx, t, other, websocket.StatusMessageTooBig, "")
+}
+
+func checkSessionCommands(ctx context.Context, t *testing.T, conn *websocket.Conn) {
+	t.Helper()
+
+	maxID := strings.Repeat("x", idLimit)
+	for _, trial := range []struct{ send, key, want, id string }{
+		{`{"type":"ping"}`, typeKey, pong, ""},
+		{`{"type": "ping"}`, typeKey, pong, ""},
+		{`{"type":"ping","id":"p1"}`, typeKey, pong, `"p1"`},
+		{`{"type":"ping","id":5}`, typeKey, pong, ""},
+		{`{"type":"ping","id":"` + maxID + `x"}`, typeKey, pong, ""},
+		{`{"type":"ping","id":"` + maxID + `"}`, typeKey, pong, `"` + maxID + `"`},
+		{"{\"type\":\"ping\"}\n", typeKey, pong, ""},
+		{`[]`, codeKey, badFrame, ""},
+		{`{"type":"hello","subscriptions":[{"provider":"github"}]}`, codeKey, "bad_subscription", ""},
+		{`{"type":"hello","resume_after":0}`, "message", unsupported, ""},
+		{`{"type":"hello","import":{}}`, "message", unsupported, ""},
+		{`{"type":"hello","more":3,"id":"` + maxID + `x"}`, codeKey, badFrame, ""},
+		{`{"type":"hello","subscriptions":{}}`, codeKey, badFrame, ""},
+		{`{"type":"hello","subscriptions":[` + strings.Repeat(`{},`, subscriptionLimit-1) + `{}]}`, codeKey, "limit", ""},
+	} {
+		checkEqual(t, string(checkSessionReply(ctx, t, conn, trial.send, trial.key, trial.want)["id"]), trial.id)
+	}
+
+	limit := session{stream: nil, conn: nil, events: make(chan jetstream.Msg), subscriptions: nil}
+	subs := `[` + strings.Repeat(pushSubscription+",", subscriptionLimit-1) + pushSubscription + `]`
+	reply := limit.hello(ctx, sessionObject{"more": json.RawMessage("true"), subsKey: json.RawMessage(subs)})
+	checkEqual(t, reply == nil, true)
+	checkEqual(t, len(limit.subscriptions), subscriptionLimit)
+}
+
+func TestSessionDeliveryErrors(t *testing.T) {
+	t.Parallel()
+
+	var sent []jetstream.Msg
+
+	handler := consumeErrorHandler(func(msg jetstream.Msg) { sent = append(sent, msg) })
+	handler(nil, jetstream.ErrNoHeartbeat)
+	checkEqual(t, len(sent), 0)
+	handler(nil, jetstream.ErrNotJSMessage)
+	checkEqual(t, len(sent), 1)
+	checkEqual(t, sent[0], nil)
+
+	sub, err := filter.Parse([]byte(pushSubscription))
+	checkError(t, err)
+
+	peer := session{stream: nil, conn: nil, events: nil, subscriptions: []filter.Subscription{sub}}
+	checkEqual[error](t, peer.deliver(t.Context(), invalidSessionMessage{Msg: nil}), jetstream.ErrNotJSMessage)
+}
+
+type invalidSessionMessage struct{ jetstream.Msg }
+
+func (invalidSessionMessage) Data() []byte { return []byte(pushSubscription) }
+
+func (invalidSessionMessage) Metadata() (*jetstream.MsgMetadata, error) {
+	return nil, jetstream.ErrNotJSMessage
 }
 
 func checkSessionHandshakes(t *testing.T, api *sessionAPI) {

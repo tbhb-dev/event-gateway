@@ -82,6 +82,7 @@ go_test(
     # The whole-module Go checks in the root package take the tests too.
     visibility = ["//:__pkg__"],
     deps = [
+        "//internal/filter",
         "@com_github_coder_websocket//:websocket",
         "@com_github_go_logr_logr//funcr",
         "@com_github_nats_io_nats_go//:nats_go",
