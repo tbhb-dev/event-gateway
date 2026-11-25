@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright Tony Burns
-# cspell:words eventfields
+# cspell:words eventfields temporaltarget
 
 ---
 # Import contracts. Every package must belong to a component.
@@ -16,6 +16,7 @@ components:
   eventfields: {in: internal/eventfields}
   filter: {in: internal/filter}
   routing: {in: internal/routing}
+  temporaltarget: {in: internal/temporaltarget}
 
 vendors:
   websocket:
@@ -44,3 +45,5 @@ deps:
     mayDependOn: [filter]
   routing:
     mayDependOn: [routing, filter]
+  temporaltarget:
+    mayDependOn: [temporaltarget, eventfields, routing]

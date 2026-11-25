@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright Tony Burns
-# cspell:words eventfields
+# cspell:words eventfields temporaltarget
 
 load("@bazel_env.bzl", "bazel_env")
 load("@bazelrc-preset.bzl", "bazelrc_preset")
@@ -89,6 +89,7 @@ GO_TARGETS = [
     "//internal/eventfields:eventfields_test",
     "//internal/filter:filter_test",
     "//internal/routing:routing_test",
+    "//internal/temporaltarget:temporaltarget_test",
 ]
 
 golangci_lint_test(
@@ -154,6 +155,14 @@ gobco_test(
     go_sum = "go.sum",
     proxy = "@go_mod_proxy//:proxy",
     tests = ["//internal/routing:routing_test"],
+)
+
+gobco_test(
+    name = "temporaltarget_gobco_test",
+    go_mod = "go.mod",
+    go_sum = "go.sum",
+    proxy = "@go_mod_proxy//:proxy",
+    tests = ["//internal/temporaltarget:temporaltarget_test"],
 )
 
 # Every file of the repository, for the whole-tree checks below. Each package
