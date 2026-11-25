@@ -42,24 +42,25 @@ func TestHealthcheck(t *testing.T) {
 
 	for _, test := range []struct {
 		name    string
+		wantErr error
 		args    []string
-		wantErr bool
 	}{
-		{"success", []string{"-addr", okAddr}, false},
-		{"non-200", []string{"-addr=" + badAddr}, true},
-		{"redirect", []string{"-addr=" + strings.TrimPrefix(redirect.URL, "http://")}, true},
-		{"empty address", []string{"-addr="}, true},
-		{"path", []string{"-addr=127.0.0.1:80/healthz"}, true},
-		{"host path", []string{"-addr=127.0.0.1/x:80"}, true},
-		{"query", []string{"-addr=127.0.0.1:80?x=1"}, true},
-		{"fragment", []string{"-addr=127.0.0.1:80#x"}, true},
-		{"whitespace", []string{"-addr=127.0.0.1 :80"}, true},
-		{"refused", []string{"-addr=" + closed}, true},
-		{"bad address", []string{"-addr=bad host"}, true},
-		{"empty host", []string{"-addr=:8080"}, true},
-		{"help", []string{"-help"}, true},
-		{"unknown flag", []string{"-nope"}, true},
-		{"extra args", []string{"-addr=" + okAddr, "extra"}, true},
+		{"success", nil, []string{"-addr", okAddr}},
+		{"non-200", errHealthcheck, []string{"-addr=" + badAddr}},
+		{"redirect", errHealthcheck, []string{"-addr=" + strings.TrimPrefix(redirect.URL, "http://")}},
+		{"empty address", errHealthcheckUsage, []string{"-addr="}},
+		{"path", errHealthcheckUsage, []string{"-addr=127.0.0.1:80/healthz"}},
+		{"host path", errHealthcheckUsage, []string{"-addr=127.0.0.1/x:80"}},
+		{"query", errHealthcheckUsage, []string{"-addr=127.0.0.1:80?x=1"}},
+		{"fragment", errHealthcheckUsage, []string{"-addr=127.0.0.1:80#x"}},
+		{"whitespace", errHealthcheckUsage, []string{"-addr=127.0.0.1 :80"}},
+		{"refused", errHealthcheck, []string{"-addr=" + closed}},
+		{"bad address", errHealthcheckUsage, []string{"-addr=bad host"}},
+		{"empty host", errHealthcheckUsage, []string{"-addr=:8080"}},
+		{"zero port", errHealthcheckUsage, []string{"-addr=localhost:0"}},
+		{"help", errHealthcheckUsage, []string{"-help"}},
+		{"unknown flag", errHealthcheckUsage, []string{"-nope"}},
+		{"extra args", errHealthcheckUsage, []string{"-addr=" + okAddr, "extra"}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
@@ -70,7 +71,7 @@ func TestHealthcheck(t *testing.T) {
 				slog.DiscardHandler,
 				append([]string{healthcheckCommand}, test.args...),
 			)
-			checkEqual(t, runErr != nil, test.wantErr)
+			checkEqual(t, runErr, test.wantErr)
 
 			if runErr != nil {
 				for _, leak := range []string{okAddr, badAddr, closed, "secret-body"} {

@@ -84,8 +84,8 @@ func validateHealthcheckAddr(addr string) error {
 		return errHealthcheckUsage
 	}
 
-	_, err = strconv.ParseUint(port, 10, 16)
-	if err != nil {
+	number, err := strconv.ParseUint(port, 10, 16)
+	if err != nil || number == 0 {
 		return errHealthcheckUsage
 	}
 

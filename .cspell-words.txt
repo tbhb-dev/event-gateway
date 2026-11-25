@@ -217,7 +217,6 @@ traceexport
 tracepb
 errorlint
 forcetypeassert
-musttag
 facebookgo
 objx
 robfig

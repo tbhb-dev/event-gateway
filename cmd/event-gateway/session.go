@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"slices"
@@ -24,6 +25,7 @@ const (
 	sessionProtocol   = "gateway.v1"
 	sessionPath       = "/connect"
 	upgradeHeader     = "Upgrade"
+	sessionFrameLimit = 4096
 	codeKey           = "code"
 	subscriptionLimit = 256
 	helloTimeout      = 10 * time.Second
@@ -75,8 +77,7 @@ func (api *sessionAPI) connect(writer http.ResponseWriter, req *http.Request) {
 			return
 		}
 
-		//nolint:mnd // The protocol caps every client frame at 4 KiB.
-		conn.SetReadLimit(4096)
+		conn.SetReadLimit(sessionFrameLimit)
 
 		api.telemetry.logger.InfoContext(req.Context(), "session connected", "token.name", name)
 
@@ -179,12 +180,15 @@ type sessionReply map[string]any
 type sessionObject map[string]json.RawMessage
 
 func (s *session) command(ctx context.Context, frame sessionFrame, waiting bool) sessionReply {
+	reply := errorReply(badFrame, "unexpected message")
+	if frame.kind != websocket.MessageText {
+		return reply
+	}
+
 	object := sessionJSON[sessionObject](frame.data)
 	kind := sessionJSON[string](object[typeKey])
-	reply := errorReply(badFrame, "unexpected message")
 
 	switch {
-	case frame.kind != websocket.MessageText:
 	case kind == "ping":
 		reply = sessionReply{typeKey: "pong"}
 	case kind == helloKind && waiting:
@@ -242,7 +246,7 @@ func (s *session) hello(ctx context.Context, object sessionObject) sessionReply 
 	// Creating the consumer sets the live boundary. The run loop starts
 	// receiving its events after the final hello, once all filters are known.
 	if s.events == nil && !s.consume(ctx) {
-		return errorReply(badFrame, "stream unavailable")
+		return errorReply("internal", "stream unavailable")
 	}
 
 	s.subscriptions = subs
@@ -271,10 +275,7 @@ func (s *session) consume(ctx context.Context) bool {
 		}
 	}
 
-	pull, err := consumer.Consume(
-		send,
-		jetstream.ConsumeErrHandler(func(jetstream.ConsumeContext, error) { send(nil) }),
-	)
+	pull, err := consumer.Consume(send, consumeErrorHandler(send))
 	if err != nil {
 		close(s.events)
 	} else {
@@ -282,6 +283,14 @@ func (s *session) consume(ctx context.Context) bool {
 	}
 
 	return true
+}
+
+func consumeErrorHandler(send func(jetstream.Msg)) jetstream.ConsumeErrHandler {
+	return func(_ jetstream.ConsumeContext, err error) {
+		if !errors.Is(err, jetstream.ErrNoHeartbeat) {
+			send(nil)
+		}
+	}
 }
 
 func (s *session) deliver(ctx context.Context, message jetstream.Msg) error {
@@ -297,8 +306,10 @@ func (s *session) deliver(ctx context.Context, message jetstream.Msg) error {
 	fields := filter.Extract(event.Event, event.Payload)
 	for _, sub := range s.subscriptions {
 		if sub.Matches(event.Provider, event.Event, event.Repository, fields) {
-			//nolint:errcheck // Ordered delivery validates metadata.
-			meta, _ := message.Metadata()
+			meta, err := message.Metadata()
+			if err != nil {
+				return err //nolint:wrapcheck // The run loop converts delivery errors into the protocol close status.
+			}
 
 			return s.write(ctx, sequenceEnvelope(meta.Sequence.Stream, message.Data()))
 		}

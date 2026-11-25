@@ -92,6 +92,7 @@ go_test(
     visibility = ["//:__pkg__"],
     deps = [
         "//internal/eventfields",
+        "//internal/filter",
         "//internal/routing",
         "//internal/temporaltarget",
         "@com_github_coder_websocket//:websocket",
