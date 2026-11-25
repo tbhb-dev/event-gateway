@@ -81,7 +81,12 @@ func fakeMCPGateway(
 	return server, requests
 }
 
-func receiveGatewayHello(ctx context.Context, t *testing.T, conn *websocket.Conn, resume string) sessionObject {
+func receiveGatewayHello(
+	ctx context.Context,
+	t *testing.T,
+	conn *websocket.Conn,
+	resume, imported string,
+) sessionObject {
 	t.Helper()
 
 	kind, data, err := conn.Read(ctx)
@@ -92,7 +97,7 @@ func receiveGatewayHello(ctx context.Context, t *testing.T, conn *websocket.Conn
 	frame := sessionJSON[sessionObject](data)
 	checkEqual(t, string(frame[typeKey]) == `"hello"`, true)
 	checkEqual(t, string(frame[resumeKey]), resume)
-	checkEqual(t, frame["import"] == nil, true)
+	checkEqual(t, string(frame["import"]), imported)
 
 	return frame
 }
@@ -121,10 +126,10 @@ func TestMCPGatewayFrames(t *testing.T) {
 	checkMCPGatewayHelloBoundary(t, subs[:12])
 
 	server, requests := fakeMCPGateway(t, []int{http.StatusSwitchingProtocols}, func(conn *websocket.Conn) {
-		frame := receiveGatewayHello(ctx, t, conn, "0")
+		frame := receiveGatewayHello(ctx, t, conn, "0", "")
 		checkEqual(t, string(frame["more"]) == "true", true)
 		got := sessionJSON[[]filter.Subscription](frame[subsKey])
-		frame = receiveGatewayHello(ctx, t, conn, "")
+		frame = receiveGatewayHello(ctx, t, conn, "", "")
 		checkEqual(t, frame["more"] == nil, true)
 		got = append(got, sessionJSON[[]filter.Subscription](frame[subsKey])...)
 		checkEqual(t, reflect.DeepEqual(got, subs), true)
@@ -178,13 +183,18 @@ func checkMCPGatewayHelloBoundary(t *testing.T, subscriptions []filter.Subscript
 
 	subs := slices.Clone(subscriptions)
 	subs[0].Repository += "xxxx" // Bring the combined frame from 4092 to 4096 bytes.
-	frames, err := gatewayHelloFrames(subs, nil)
+	frames, err := gatewayHelloFrames(subs, nil, false)
 	checkEqual(t, err == nil, true)
 	checkEqual(t, len(frames), 1)
 	checkEqual(t, len(frames[0]), sessionFrameLimit)
 
+	frames, err = gatewayHelloFrames(subs, nil, true)
+	checkError(t, err)
+	checkEqual(t, len(frames), 2)
+	checkEqual(t, len(frames[0]) <= sessionFrameLimit, true)
+
 	subs[0].Repository += "x"
-	frames, err = gatewayHelloFrames(subs, nil)
+	frames, err = gatewayHelloFrames(subs, nil, false)
 	checkEqual(t, err == nil, true)
 	checkEqual(t, len(frames), 2)
 
@@ -208,7 +218,7 @@ func TestMCPGatewayReconnect(t *testing.T) {
 
 	statuses := []int{fail, accept, accept, fail, fail, fail, fail, fail, fail, accept, accept}
 	server, requests := fakeMCPGateway(t, statuses, func(conn *websocket.Conn) {
-		frame := receiveGatewayHello(ctx, t, conn, "")
+		frame := receiveGatewayHello(ctx, t, conn, "", "")
 		got := sessionJSON[[]filter.Subscription](frame[subsKey])
 
 		switch connections.Add(1) {
@@ -269,6 +279,57 @@ func TestMCPGatewayReconnect(t *testing.T) {
 	checkEqual(t, strings.Contains(logs.String(), mcpFixture), false)
 }
 
+//nolint:paralleltest // The awrel state fixture sets process-wide environment variables.
+func TestMCPGatewayImport(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	const (
+		subscriptionCount = 64
+		caughtUp          = `{"type":"caught_up","seq":12}`
+	)
+
+	_, legacy := awrelStatePaths(t)
+	document := mcpStateDocument(mcpStateTestSubscriptions(subscriptionCount))
+	checkError(t, os.WriteFile(legacy, []byte(document), 0o600))
+
+	logger := slog.New(slog.DiscardHandler)
+	subs := loadMCPSubscriptions(ctx, logger)
+	want := subs.list()
+	checkEqual(t, len(want), subscriptionCount)
+
+	steps := [...]struct{ resume, imported, reply string }{
+		{"", jsonTrue, ""}, {"", jsonTrue, caughtUp}, {"12", "", ""},
+	}
+
+	var connections atomic.Int32
+
+	server, requests := fakeMCPGateway(t, []int{http.StatusSwitchingProtocols}, func(conn *websocket.Conn) {
+		step := steps[connections.Add(1)-1]
+		frame := receiveGatewayHello(ctx, t, conn, step.resume, step.imported)
+		checkEqual(t, string(frame["more"]), jsonTrue)
+		got := sessionJSON[[]filter.Subscription](frame[subsKey])
+		frame = receiveGatewayHello(ctx, t, conn, "", "")
+		checkEqual(t, frame["more"] == nil, true)
+		got = append(got, sessionJSON[[]filter.Subscription](frame[subsKey])...)
+		checkEqual(t, reflect.DeepEqual(got, want), true)
+
+		if step.reply != "" {
+			checkError(t, conn.Write(ctx, websocket.MessageText, []byte(step.reply)))
+		}
+	})
+
+	retries := 0
+	err := runMCPGateway(ctx, logger, server.URL+sessionPath, mcpFixture, subs,
+		func(channelEvent) bool { return true }, func(context.Context, time.Duration) bool {
+			retries++
+
+			return retries < len(steps)
+		})
+	checkError(t, err)
+	checkEqual(t, requests.Load(), int32(len(steps)))
+}
+
 func TestMCPGatewayResume(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
@@ -305,7 +366,7 @@ func TestMCPGatewayResume(t *testing.T) {
 
 	server, requests := fakeMCPGateway(t, []int{http.StatusSwitchingProtocols}, func(conn *websocket.Conn) {
 		step := steps[connections.Add(1)-1]
-		frame := receiveGatewayHello(ctx, t, conn, step.resume)
+		frame := receiveGatewayHello(ctx, t, conn, step.resume, "")
 		checkEqual(t, string(frame[subsKey]), "["+mcpStateTestSubscription+"]")
 
 		for _, data := range step.frames {
@@ -449,7 +510,7 @@ func TestMCPGatewayRejection(t *testing.T) {
 			defer cancel()
 
 			server, requests := fakeMCPGateway(t, []int{status}, func(conn *websocket.Conn) {
-				checkEqual(t, string(receiveGatewayHello(ctx, t, conn, "")[subsKey]) == "[]", true)
+				checkEqual(t, string(receiveGatewayHello(ctx, t, conn, "", "")[subsKey]) == "[]", true)
 				checkEqual(t, conn.Close(tokenRevoked, mcpFixture) == nil, true)
 			})
 
@@ -561,7 +622,7 @@ func checkMCPGatewayLifetime(t *testing.T, name string) {
 	server, requests := fakeMCPGateway(t, []int{http.StatusSwitchingProtocols}, func(conn *websocket.Conn) {
 		defer close(disconnected)
 
-		checkEqual(t, string(receiveGatewayHello(ctx, t, conn, "")[subsKey]), "["+mcpStateTestSubscription+"]")
+		checkEqual(t, string(receiveGatewayHello(ctx, t, conn, "", "")[subsKey]), "["+mcpStateTestSubscription+"]")
 		checkEqual(t, conn.Write(ctx, websocket.MessageText, []byte(`{"type":"gap","from":3,"to":5}`)) == nil, true)
 
 		if name != claudeCodeClient {

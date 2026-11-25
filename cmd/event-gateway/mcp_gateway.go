@@ -197,7 +197,9 @@ func runGatewayConnection(
 	// The server may expand each payload byte to a JSON escape.
 	conn.SetReadLimit(int64(len(`\u003c`)*maxPayload + sessionFrameLimit))
 
-	frames, err := gatewayHelloFrames(subscriptions.snapshot())
+	subs, cursor := subscriptions.snapshot()
+
+	frames, err := gatewayHelloFrames(subs, cursor, subscriptions.imported)
 	if err != nil {
 		return err
 	}
@@ -231,7 +233,7 @@ func rejectGatewayToken(notify func(channelEvent) bool) error {
 	return errGatewayToken
 }
 
-func gatewayHelloFrames(subscriptions []filter.Subscription, cursor *uint64) ([][]byte, error) {
+func gatewayHelloFrames(subscriptions []filter.Subscription, cursor *uint64, imported bool) ([][]byte, error) {
 	const (
 		prefix = `{"type":"hello","subscriptions":[`
 		final  = `]}`
@@ -241,9 +243,13 @@ func gatewayHelloFrames(subscriptions []filter.Subscription, cursor *uint64) ([]
 	var frames [][]byte
 
 	frame := []byte(prefix)
-	if cursor != nil {
+
+	switch {
+	case cursor != nil:
 		frame = strconv.AppendUint([]byte(`{"type":"hello","resume_after":`), *cursor, decimal)
 		frame = append(frame, `,"subscriptions":[`...)
+	case imported:
+		frame = []byte(`{"type":"hello","import":true,"subscriptions":[`)
 	}
 
 	for index, sub := range subscriptions {

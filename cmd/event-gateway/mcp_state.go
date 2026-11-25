@@ -13,6 +13,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -28,6 +30,8 @@ const (
 	mcpStateHomeWarning  = "MCP subscription state directory is unavailable."
 	mcpStateReadWarning  = "MCP subscription state could not be fully loaded."
 	mcpStateWriteWarning = "MCP subscription state could not be saved."
+	awrelStateWarning    = "awrel subscriptions could not be fully imported."
+	awrelStateLimit      = 1 << 20
 	mcpStateVersion      = 1
 	mcpStateDirMode      = 0o700
 	mcpStateFileMode     = 0o600
@@ -61,31 +65,45 @@ func loadMCPSubscriptions(ctx context.Context, logger *slog.Logger) *mcpSubscrip
 		return subs
 	}
 
+	file := filepath.Join("sessions", fmt.Sprintf("%x.json", sha256.Sum256([]byte(key))))
 	state := mcpState{
 		logger:    logger,
 		dir:       dir,
-		file:      filepath.Join(mcpServerName, "sessions", fmt.Sprintf("%x.json", sha256.Sum256([]byte(key)))),
+		file:      filepath.Join(mcpServerName, file),
 		writeFile: (*os.File).Write,
 	}
-	if !state.load(subs) {
+
+	valid, missing := state.load(subs)
+	if missing {
+		valid = loadAwrelSubscriptions(ctx, logger, filepath.Join(dir, "awrel"), file, subs)
+	}
+
+	if !valid {
 		logger.WarnContext(ctx, mcpStateReadWarning)
 	}
 
 	subs.state = state
+	if subs.imported {
+		// Startup owns the subscriptions until they are returned to the caller.
+		subs.saveLocked()
+	}
 
 	return subs
 }
 
-func (state mcpState) load(subs *mcpSubscriptions) bool {
+// load reports whether the state is valid and whether its file is missing.
+func (state mcpState) load(subs *mcpSubscriptions) (bool, bool) {
 	root, err := os.OpenRoot(state.dir)
 	if err != nil {
-		return false
+		return false, false
 	}
 	defer root.Close()
 
 	data, err := root.ReadFile(state.file)
 	if err != nil {
-		return false
+		_, statErr := root.Lstat(state.file)
+
+		return false, errors.Is(statErr, fs.ErrNotExist)
 	}
 
 	var saved struct {
@@ -95,12 +113,74 @@ func (state mcpState) load(subs *mcpSubscriptions) bool {
 	}
 
 	if json.Unmarshal(data, &saved) != nil || saved.Version != mcpStateVersion || saved.Subscriptions == nil {
+		return false, false
+	}
+
+	valid := subs.restore(saved.Subscriptions, len(saved.Subscriptions))
+	if valid {
+		subs.cursor = saved.Cursor
+	}
+
+	return valid, false
+}
+
+// loadAwrelSubscriptions reports whether there was state to import or warn about.
+func loadAwrelSubscriptions(ctx context.Context, logger *slog.Logger, dir, path string, subs *mcpSubscriptions) bool {
+	data, exists := readAwrelState(dir, path)
+	if !exists {
 		return false
 	}
 
+	var saved struct {
+		Subscriptions []json.RawMessage `json:"subscriptions"`
+		Version       int               `json:"version"`
+	}
+
+	valid := false
+	if len(data) <= awrelStateLimit && json.Unmarshal(data, &saved) == nil &&
+		saved.Version == mcpStateVersion && len(saved.Subscriptions) > 0 {
+		valid = subs.restore(saved.Subscriptions, subscriptionLimit)
+		subs.imported = len(subs.subs) > 0
+	}
+
+	if !valid {
+		logger.WarnContext(ctx, awrelStateWarning)
+	}
+
+	return true
+}
+
+func readAwrelState(dir, path string) ([]byte, bool) {
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return nil, !errors.Is(err, fs.ErrNotExist)
+	}
+	defer root.Close()
+
+	file, err := root.Open(path)
+	if err != nil {
+		_, statErr := root.Lstat(path)
+
+		return nil, !errors.Is(statErr, fs.ErrNotExist)
+	}
+	defer file.Close()
+
+	data, err := io.ReadAll(io.LimitReader(file, awrelStateLimit+1))
+	if err != nil {
+		return nil, true
+	}
+
+	return data, true
+}
+
+func (s *mcpSubscriptions) restore(rawSubscriptions []json.RawMessage, limit int) bool {
 	valid := true
 
-	for _, raw := range saved.Subscriptions {
+	for _, raw := range rawSubscriptions {
+		if len(s.subs) == limit {
+			return false
+		}
+
 		sub, parseErr := filter.Parse(raw)
 		if parseErr != nil {
 			valid = false
@@ -108,11 +188,7 @@ func (state mcpState) load(subs *mcpSubscriptions) bool {
 			continue
 		}
 
-		subs.set(sub, true)
-	}
-
-	if valid {
-		subs.cursor = saved.Cursor
+		s.set(sub, true)
 	}
 
 	return valid
